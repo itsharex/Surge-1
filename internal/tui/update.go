@@ -138,6 +138,8 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.state {
 		case DashboardState:
 			if msg.String() == "q" || msg.String() == "ctrl+c" {
+				// Graceful shutdown: pause all active downloads to save state
+				m.Pool.PauseAll()
 				return m, tea.Quit
 			}
 			if msg.String() == "g" {
@@ -177,13 +179,27 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					d := m.downloads[m.cursor]
 					if !d.done {
 						if d.paused {
-							m.Pool.Resume(d.ID)
+							// Resume: create config and add to pool
+							d.paused = false
+							d.state.Resume()
+							cfg := downloader.DownloadConfig{
+								URL:        d.URL,
+								OutputPath: m.PWD, // Will be resolved in TUIDownload
+								ID:         d.ID,
+								Filename:   d.Filename,
+								Verbose:    false,
+								ProgressCh: m.progressChan,
+								State:      d.state,
+							}
+							m.Pool.Add(cfg)
+							// Restart polling
+							cmds = append(cmds, d.reporter.PollCmd())
 						} else {
 							m.Pool.Pause(d.ID)
 						}
 					}
 				}
-				return m, nil
+				return m, tea.Batch(cmds...)
 			}
 
 		case DetailState:

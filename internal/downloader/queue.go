@@ -68,6 +68,23 @@ func (p *WorkerPool) Pause(downloadID int) {
 	}
 }
 
+// PauseAll pauses all active downloads (for graceful shutdown)
+func (p *WorkerPool) PauseAll() {
+	p.mu.RLock()
+	ids := make([]int, 0, len(p.downloads))
+	for id, ad := range p.downloads {
+		// Only pause downloads that are actually active (not already paused or done)
+		if ad != nil && ad.config.State != nil && !ad.config.State.IsPaused() && !ad.config.State.Done.Load() {
+			ids = append(ids, id)
+		}
+	}
+	p.mu.RUnlock()
+
+	for _, id := range ids {
+		p.Pause(id)
+	}
+}
+
 // Resume resumes a paused download by ID
 func (p *WorkerPool) Resume(downloadID int) {
 	p.mu.RLock()

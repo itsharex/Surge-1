@@ -104,8 +104,27 @@ func InitialRootModel() RootModel {
 
 	pwd, _ := os.Getwd()
 
+	// Load paused downloads from master list
+	var downloads []*DownloadModel
+	surgeDir := pwd + "/.surge"
+	if pausedEntries, err := downloader.LoadPausedDownloads(surgeDir); err == nil {
+		for i, entry := range pausedEntries {
+			id := i + 1 // Assign sequential IDs
+			dm := NewDownloadModel(id, entry.URL, entry.Filename, 0)
+			dm.paused = true
+			// Load actual progress from state file
+			if state, err := downloader.LoadState(entry.DestPath, entry.URL); err == nil {
+				dm.Downloaded = state.Downloaded
+				dm.Total = state.TotalSize
+				dm.state.Downloaded.Store(state.Downloaded)
+				dm.state.SetTotalSize(state.TotalSize)
+			}
+			downloads = append(downloads, dm)
+		}
+	}
+
 	return RootModel{
-		downloads:    make([]*DownloadModel, 0),
+		downloads:    downloads,
 		inputs:       []textinput.Model{urlInput, pathInput, filenameInput},
 		state:        DashboardState,
 		progressChan: progressChan,

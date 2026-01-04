@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -324,7 +325,7 @@ func (d *ConcurrentDownloader) Download(ctx context.Context, rawurl, destPath st
 
 	// Create task queue - check for saved state first (resume case)
 	var tasks []Task
-	savedState, err := LoadState(destPath, d.ID)
+	savedState, err := LoadState(destPath, rawurl)
 	if err == nil && savedState != nil && len(savedState.Tasks) > 0 {
 		// Resume: use saved tasks and reset downloaded counter
 		tasks = savedState.Tasks
@@ -444,14 +445,15 @@ func (d *ConcurrentDownloader) Download(ctx context.Context, rawurl, destPath st
 
 		// Save state for resume
 		state := &DownloadState{
-			ID:         d.ID,
+			URLHash:    URLHash(d.URL),
 			URL:        d.URL,
 			DestPath:   destPath,
 			TotalSize:  fileSize,
 			Downloaded: d.State.Downloaded.Load(),
 			Tasks:      remainingTasks,
+			Filename:   filepath.Base(destPath),
 		}
-		if err := SaveState(destPath, state); err != nil {
+		if err := SaveState(destPath, d.URL, state); err != nil {
 			utils.Debug("Failed to save pause state: %v", err)
 		}
 
@@ -469,7 +471,7 @@ func (d *ConcurrentDownloader) Download(ctx context.Context, rawurl, destPath st
 	}
 
 	// Delete state file on successful completion
-	_ = DeleteState(destPath, d.ID)
+	_ = DeleteState(destPath, d.URL)
 
 	// Print final stats
 	elapsed := time.Since(startTime)
