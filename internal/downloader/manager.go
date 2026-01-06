@@ -35,21 +35,38 @@ type ProbeResult struct {
 func probeServer(ctx context.Context, rawurl string, filenameHint string) (*ProbeResult, error) {
 	utils.Debug("Probing server: %s", rawurl)
 
-	probeCtx, cancel := context.WithTimeout(ctx, ProbeTimeout)
-	defer cancel()
+	var resp *http.Response
+	var err error
 
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, rawurl, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create probe request: %w", err)
+	// Retry logic for probe request
+	for i := 0; i < 3; i++ {
+		if i > 0 {
+			time.Sleep(1 * time.Second)
+			utils.Debug("Retrying probe... attempt %d", i+1)
+		}
+
+		probeCtx, cancel := context.WithTimeout(ctx, ProbeTimeout)
+		defer cancel()
+
+		req, reqErr := http.NewRequestWithContext(probeCtx, http.MethodGet, rawurl, nil)
+		if reqErr != nil {
+			err = fmt.Errorf("failed to create probe request: %w", reqErr)
+			break // Fatal error, don't retry
+		}
+
+		req.Header.Set("Range", "bytes=0-0")
+		req.Header.Set("User-Agent", ua)
+
+		resp, err = probeClient.Do(req)
+		if err == nil {
+			break // Success
+		}
 	}
 
-	req.Header.Set("Range", "bytes=0-0")
-	req.Header.Set("User-Agent", ua)
-
-	resp, err := probeClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("probe request failed: %w", err)
+		return nil, fmt.Errorf("probe request failed after retries: %w", err)
 	}
+
 	defer func() {
 		io.Copy(io.Discard, resp.Body) // Drain any remaining data
 		resp.Body.Close()

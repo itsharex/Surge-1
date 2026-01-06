@@ -41,7 +41,7 @@ const (
 	DefaultExpectContinueTimeout = 1 * time.Second
 	DialTimeout                  = 10 * time.Second
 	KeepAliveDuration            = 30 * time.Second
-	ProbeTimeout                 = 10 * time.Second
+	ProbeTimeout                 = 30 * time.Second
 )
 
 // Channel buffer sizes
