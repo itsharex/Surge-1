@@ -279,7 +279,12 @@ func (m RootModel) View() string {
 		tabBar,
 		listContent,
 	))
-	listBox := renderBtopBox("Downloads", listInner, leftWidth, listHeight, ColorNeonPink, true)
+	// Determine border color for downloads box based on focus
+	downloadsBorderColor := ColorNeonPink
+	if m.logFocused {
+		downloadsBorderColor = ColorGray
+	}
+	listBox := renderBtopBox("Downloads", listInner, leftWidth, listHeight, downloadsBorderColor, true)
 
 	// --- SECTION 4: DETAILS PANE (Bottom Right) ---
 	var detailContent string
