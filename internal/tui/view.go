@@ -157,14 +157,8 @@ func (m RootModel) View() string {
 	// Tab Bar
 	tabBar := renderTabs(m.activeTab)
 
-	// Calculate list height (Total bottom height - Tab bar height)
-	listHeight := bottomHeight - 2 // Tabs take ~2 lines
-	if listHeight < 5 {
-		listHeight = 5
-	}
-
-	// Render List
-	listContent := m.renderDownloadList(leftWidth-4, listHeight)
+	// Render the bubbles list
+	listContent := m.list.View()
 
 	listBox := ListStyle.
 		Width(leftWidth).
@@ -176,9 +170,8 @@ func (m RootModel) View() string {
 
 	// --- SECTION 4: DETAILS PANE (Bottom Right) ---
 	var detailContent string
-	filtered := m.getFilteredDownloads()
-	if len(filtered) > 0 && m.cursor < len(filtered) {
-		detailContent = renderFocusedDetails(filtered[m.cursor], rightWidth-4)
+	if d := m.GetSelectedDownload(); d != nil {
+		detailContent = renderFocusedDetails(d, rightWidth-4)
 	} else {
 		detailContent = lipgloss.Place(rightWidth-4, bottomHeight-4, lipgloss.Center, lipgloss.Center,
 			lipgloss.NewStyle().Foreground(ColorGray).Render("No Download Selected"))
@@ -201,82 +194,8 @@ func (m RootModel) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left,
 		topRow,
 		bottomRow,
-		lipgloss.NewStyle().Foreground(ColorGray).Padding(0, 1).Render(" [G] Add  [P] Pause  [D] Delete  [Q] Quit"),
+		lipgloss.NewStyle().Foreground(ColorGray).Padding(0, 1).Render(" [G] Add  [P] Pause  [D] Delete  [/] Filter  [Q] Quit"),
 	)
-}
-
-// Helper to render the list
-func (m RootModel) renderDownloadList(w, h int) string {
-	var rows []string
-	filtered := m.getFilteredDownloads()
-
-	// Item height is roughly 2 lines
-	itemHeight := 2
-	visibleCount := h / itemHeight
-	if visibleCount < 1 {
-		visibleCount = 1
-	}
-
-	start := m.scrollOffset
-	end := start + visibleCount
-	if end > len(filtered) {
-		end = len(filtered)
-	}
-
-	for i := start; i < end; i++ {
-		if i >= len(filtered) {
-			break
-		}
-		d := filtered[i]
-		isSelected := (i == m.cursor)
-
-		// Compact Row Style
-		style := lipgloss.NewStyle().
-			Border(lipgloss.NormalBorder(), false, false, false, true). // Left border only
-			BorderForeground(ColorGray).
-			Padding(0, 1).
-			Width(w)
-
-		if isSelected {
-			style = style.
-				BorderForeground(ColorNeonPink).
-				Background(lipgloss.Color("#44475a")) // Highlight bg
-		}
-
-		// Progress
-		pct := 0.0
-		if d.Total > 0 {
-			pct = float64(d.Downloaded) / float64(d.Total)
-		}
-		progStr := fmt.Sprintf("%.0f%%", pct*100)
-		statusIcon := "⬇"
-		if d.done {
-			statusIcon = "✔"
-		}
-		if d.paused {
-			statusIcon = "⏸"
-		}
-		if d.err != nil {
-			statusIcon = "✖"
-		}
-
-		title := truncateString(d.Filename, w-20)
-
-		row := lipgloss.JoinHorizontal(lipgloss.Left,
-			lipgloss.NewStyle().Width(3).Foreground(ColorNeonPurple).Render(statusIcon),
-			lipgloss.NewStyle().Width(w-15).Render(title),
-			lipgloss.NewStyle().Foreground(ColorNeonCyan).Render(progStr),
-		)
-
-		rows = append(rows, style.Render(row))
-	}
-
-	// Fill empty space
-	for len(rows) < visibleCount {
-		rows = append(rows, "")
-	}
-
-	return lipgloss.JoinVertical(lipgloss.Left, rows...)
 }
 
 // Helper to render the detailed info pane

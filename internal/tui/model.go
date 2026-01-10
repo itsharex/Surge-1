@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/filepicker"
+	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -75,9 +76,8 @@ type RootModel struct {
 	// File picker for directory selection
 	filepicker filepicker.Model
 
-	// Navigation
-	cursor       int
-	scrollOffset int // First visible download index for viewport scrolling
+	// Bubbles list component for download listing
+	list list.Model
 
 	Pool *downloader.WorkerPool //Works as the download queue
 	PWD  string
@@ -91,9 +91,6 @@ type RootModel struct {
 	pendingPath     string // Path pending confirmation
 	pendingFilename string // Filename pending confirmation
 	duplicateInfo   string // Info about the duplicate
-
-	// Search
-	searchQuery string // Current search filter
 
 	// Graph Data
 	SpeedHistory []float64 // Stores the last ~60 ticks of speed data
@@ -172,6 +169,9 @@ func InitialRootModel() RootModel {
 		}
 	}
 
+	// Initialize the download list
+	downloadList := NewDownloadList(80, 20) // Default size, will be resized on WindowSizeMsg
+
 	return RootModel{
 		downloads:      downloads,
 		NextDownloadID: len(downloads) + 1, // Start after loaded downloads
@@ -179,6 +179,7 @@ func InitialRootModel() RootModel {
 		state:          DashboardState,
 		progressChan:   progressChan,
 		filepicker:     fp,
+		list:           downloadList,
 		Pool:           downloader.NewWorkerPool(progressChan),
 		PWD:            pwd,
 		SpeedHistory:   make([]float64, 40), // 40 points of history

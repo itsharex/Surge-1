@@ -9,6 +9,7 @@ import (
 	"surge/internal/messages"
 	"surge/internal/utils"
 
+	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -54,6 +55,9 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		utils.Debug("Adding download from server: %s", msg.URL)
 		m.Pool.Add(cfg)
+
+		// Update list items
+		m.UpdateListItems()
 		return m, nil
 
 	case messages.DownloadStartedMsg:
@@ -70,6 +74,8 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
+		// Update list items to reflect new filename
+		m.UpdateListItems()
 		cmds = append(cmds, listenForActivity(m.progressChan))
 
 	case messages.ProgressMsg:
@@ -101,6 +107,9 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					totalSpeed := m.calcTotalSpeed()
 					m.SpeedHistory = append(m.SpeedHistory[1:], totalSpeed)
 				}
+
+				// Update list to show current progress
+				m.UpdateListItems()
 				break
 			}
 		}
@@ -128,6 +137,8 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
+		// Update list items
+		m.UpdateListItems()
 		cmds = append(cmds, listenForActivity(m.progressChan))
 
 	case messages.DownloadErrorMsg:
@@ -138,6 +149,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
+		m.UpdateListItems()
 		cmds = append(cmds, listenForActivity(m.progressChan))
 
 	case messages.DownloadPausedMsg:
@@ -149,6 +161,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
+		m.UpdateListItems()
 		cmds = append(cmds, listenForActivity(m.progressChan))
 
 	case messages.DownloadResumedMsg:
@@ -160,11 +173,30 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
+		m.UpdateListItems()
 		cmds = append(cmds, listenForActivity(m.progressChan))
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+
+		// Calculate list dimensions
+		// List goes in bottom-left pane
+		availableWidth := msg.Width - 4
+		leftWidth := int(float64(availableWidth) * ListWidthRatio)
+
+		// Calculate list height (total height - header row - margins)
+		topHeight := 9
+		bottomHeight := msg.Height - topHeight - 5
+		if bottomHeight < 10 {
+			bottomHeight = 10
+		}
+
+		m.list.SetSize(leftWidth-2, bottomHeight-4)
+
+		// Update list title based on active tab
+		m.updateListTitle()
+		m.UpdateListItems()
 		return m, nil
 
 	// Handle filepicker messages for all message types when in FilePickerState
@@ -204,8 +236,8 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if msg.String() == "tab" {
 				m.activeTab = (m.activeTab + 1) % 3
-				m.cursor = 0
-				m.scrollOffset = 0
+				m.updateListTitle()
+				m.UpdateListItems()
 				return m, nil
 			}
 			if msg.String() == "h" {
@@ -217,46 +249,10 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-			if msg.String() == "/" {
-				// Enter search mode
-				m.searchQuery = ""
-				m.state = SearchState
-				return m, nil
-			}
 
-			// Navigation with viewport scroll adjustment
-			filtered := m.getFilteredDownloads()
-			if msg.String() == "up" || msg.String() == "k" {
-				if m.cursor > 0 {
-					m.cursor--
-					// Scroll up if cursor goes above visible area
-					if m.cursor < m.scrollOffset {
-						m.scrollOffset = m.cursor
-					}
-				}
-			}
-			if msg.String() == "down" || msg.String() == "j" {
-				if m.cursor < len(filtered)-1 {
-					m.cursor++
-					// Scroll down if cursor goes below visible area
-					visibleCount := m.getVisibleCount()
-					if m.cursor >= m.scrollOffset+visibleCount {
-						m.scrollOffset = m.cursor - visibleCount + 1
-					}
-				}
-			}
-
-			// Details
-			if msg.String() == "enter" {
-				if len(filtered) > 0 {
-					m.state = DetailState
-				}
-			}
-
-			// Pause/Resume toggle
+			// Pause/Resume toggle - get selected download from list
 			if msg.String() == "p" {
-				if m.cursor >= 0 && m.cursor < len(filtered) {
-					d := filtered[m.cursor]
+				if d := m.GetSelectedDownload(); d != nil {
 					if !d.done {
 						if d.paused {
 							// Resume: create config and add to pool
@@ -279,47 +275,53 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 				}
+				m.UpdateListItems()
 				return m, tea.Batch(cmds...)
 			}
 
 			// Delete download
 			if msg.String() == "d" || msg.String() == "x" {
-				if m.cursor >= 0 && m.cursor < len(filtered) {
-					targetID := filtered[m.cursor].ID
+				// Don't process delete if list is filtering
+				if m.list.FilterState() == list.Filtering {
+					break
+				}
+
+				if d := m.GetSelectedDownload(); d != nil {
+					targetID := d.ID
 
 					// Find index in real list
 					realIdx := -1
-					for i, d := range m.downloads {
-						if d.ID == targetID {
+					for i, dl := range m.downloads {
+						if dl.ID == targetID {
 							realIdx = i
 							break
 						}
 					}
 
 					if realIdx != -1 {
-						d := m.downloads[realIdx]
+						dl := m.downloads[realIdx]
 
 						// Cancel if active
-						m.Pool.Cancel(d.ID)
+						m.Pool.Cancel(dl.ID)
 
 						// Delete state files
-						if d.URL != "" {
-							_ = downloader.DeleteStateByURL(d.URL)
+						if dl.URL != "" {
+							_ = downloader.DeleteStateByURL(dl.URL)
 						}
 
 						// Remove from list
 						m.downloads = append(m.downloads[:realIdx], m.downloads[realIdx+1:]...)
-
-						// Adjust cursor if needed
-						// We need to re-evaluate the filtered list size to clamp cursor
-						newFiltered := m.getFilteredDownloads()
-						if m.cursor >= len(newFiltered) && m.cursor > 0 {
-							m.cursor--
-						}
 					}
 				}
+				m.UpdateListItems()
 				return m, nil
 			}
+
+			// Pass messages to the list for navigation/filtering
+			var cmd tea.Cmd
+			m.list, cmd = m.list.Update(msg)
+			cmds = append(cmds, cmd)
+			return m, tea.Batch(cmds...)
 
 		case DetailState:
 			if msg.String() == "esc" || msg.String() == "q" || msg.String() == "enter" {
@@ -396,6 +398,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				utils.Debug("Adding to Queue")
 				m.Pool.Add(cfg)
 
+				m.UpdateListItems()
 				return m, nil
 			}
 
@@ -501,6 +504,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.Pool.Add(cfg)
 				m.state = DashboardState
+				m.UpdateListItems()
 				return m, nil
 			}
 			if msg.String() == "x" || msg.String() == "X" || msg.String() == "esc" {
@@ -509,16 +513,10 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if msg.String() == "f" || msg.String() == "F" {
-				// Focus existing download
-				for i, d := range m.downloads {
+				// Focus existing download - find it and select in list
+				for i, d := range m.getFilteredDownloads() {
 					if d.URL == m.pendingURL {
-						m.cursor = i
-						visibleCount := m.getVisibleCount()
-						if m.cursor < m.scrollOffset {
-							m.scrollOffset = m.cursor
-						} else if m.cursor >= m.scrollOffset+visibleCount {
-							m.scrollOffset = m.cursor - visibleCount + 1
-						}
+						m.list.Select(i)
 						break
 					}
 				}
@@ -526,47 +524,16 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
-
-		case SearchState:
-			if msg.String() == "esc" {
-				// Exit search, clear query
-				m.searchQuery = ""
-				m.state = DashboardState
-				return m, nil
-			}
-			if msg.String() == "enter" {
-				// Keep filter active, return to dashboard
-				m.state = DashboardState
-				return m, nil
-			}
-			if msg.String() == "backspace" {
-				if len(m.searchQuery) > 0 {
-					m.searchQuery = m.searchQuery[:len(m.searchQuery)-1]
-				}
-				return m, nil
-			}
-			// Accept printable characters
-			if len(msg.String()) == 1 {
-				m.searchQuery += msg.String()
-			}
-			return m, nil
 		}
 	}
 
 	// Propagate messages to progress bars - only update visible ones for performance
-	visibleCount := m.getVisibleCount()
-	startIdx := m.scrollOffset
-	endIdx := m.scrollOffset + visibleCount
-	if endIdx > len(m.downloads) {
-		endIdx = len(m.downloads)
-	}
-
-	for i := startIdx; i < endIdx; i++ {
+	for _, d := range m.downloads {
 		var cmd tea.Cmd
 		var newModel tea.Model
-		newModel, cmd = m.downloads[i].progress.Update(msg)
+		newModel, cmd = d.progress.Update(msg)
 		if p, ok := newModel.(progress.Model); ok {
-			m.downloads[i].progress = p
+			d.progress = p
 		}
 		if cmd != nil {
 			cmds = append(cmds, cmd)
@@ -574,4 +541,16 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, tea.Batch(cmds...)
+}
+
+// updateListTitle updates the list title based on active tab
+func (m *RootModel) updateListTitle() {
+	switch m.activeTab {
+	case TabQueued:
+		m.list.Title = "📋 Queued"
+	case TabActive:
+		m.list.Title = "⬇️ Active"
+	case TabDone:
+		m.list.Title = "✅ Completed"
+	}
 }
