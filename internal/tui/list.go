@@ -97,7 +97,7 @@ func newDownloadDelegate() downloadDelegate {
 	}
 }
 
-func (d downloadDelegate) Height() int  { return 2 }
+func (d downloadDelegate) Height() int  { return 3 }
 func (d downloadDelegate) Spacing() int { return 1 }
 
 func (d downloadDelegate) Update(msg tea.Msg, m *list.Model) tea.Cmd {

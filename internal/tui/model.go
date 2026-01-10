@@ -190,20 +190,6 @@ func (m RootModel) Init() tea.Cmd {
 	return listenForActivity(m.progressChan)
 }
 
-// getVisibleCount returns how many download cards can fit in the current terminal height
-func (m RootModel) getVisibleCount() int {
-	availableHeight := m.height - HeaderHeight - 2 // Reserve space for footer
-	visibleCount := availableHeight / CardHeight
-	if visibleCount < 1 {
-		visibleCount = 1
-	}
-	filteredLen := len(m.getFilteredDownloads())
-	if visibleCount > filteredLen {
-		visibleCount = filteredLen
-	}
-	return visibleCount
-}
-
 func listenForActivity(sub chan tea.Msg) tea.Cmd {
 	return func() tea.Msg {
 		return <-sub
