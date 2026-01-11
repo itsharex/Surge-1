@@ -142,7 +142,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 				// Update global speed history every 500ms with rolling average
-				if time.Since(m.lastSpeedHistoryUpdate) >= 500*time.Millisecond {
+				if time.Since(m.lastSpeedHistoryUpdate) >= GraphUpdateInterval {
 					// Calculate average of buffer
 					var avgSpeed float64
 					if len(m.speedBuffer) > 0 {

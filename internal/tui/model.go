@@ -201,8 +201,8 @@ func InitialRootModel() RootModel {
 		list:           downloadList,
 		Pool:           downloader.NewWorkerPool(progressChan),
 		PWD:            pwd,
-		SpeedHistory:   make([]float64, 200), // 200 points of history to fill wide screens
-		logViewport:    viewport.New(40, 5),  // Default size, will be resized
+		SpeedHistory:   make([]float64, GraphHistoryPoints), // 60 points of history (30s at 0.5s interval)
+		logViewport:    viewport.New(40, 5),                 // Default size, will be resized
 		logEntries:     make([]string, 0),
 	}
 }

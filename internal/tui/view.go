@@ -155,16 +155,15 @@ func (m RootModel) View() string {
 	headerBox := lipgloss.JoinHorizontal(lipgloss.Top, logoBox, logBox)
 
 	// --- SECTION 2: SPEED GRAPH (Top Right) ---
-	// Use 60 data points for 30 seconds of history (2 samples per second / 0.5s interval)
-	const graphHistoryPoints = 100
+	// Use GraphHistoryPoints from config (30 seconds of history)
 
 	// Stats box width inside the Network Activity box
 	statsBoxWidth := 18
 
 	// Get the last 60 data points for the graph
 	var graphData []float64
-	if len(m.SpeedHistory) > graphHistoryPoints {
-		graphData = m.SpeedHistory[len(m.SpeedHistory)-graphHistoryPoints:]
+	if len(m.SpeedHistory) > GraphHistoryPoints {
+		graphData = m.SpeedHistory[len(m.SpeedHistory)-GraphHistoryPoints:]
 	} else {
 		graphData = m.SpeedHistory
 	}
