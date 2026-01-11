@@ -180,7 +180,7 @@ func TUIDownload(ctx context.Context, cfg DownloadConfig) error {
 }
 
 // Download is the CLI entry point (non-TUI) - convenience wrapper
-func Download(ctx context.Context, url, outPath string, verbose bool, md5sum, sha256sum string, progressCh chan<- tea.Msg, id int) error {
+func Download(ctx context.Context, url, outPath string, verbose bool, md5sum, sha256sum string, progressCh chan<- tea.Msg, id string) error {
 	cfg := DownloadConfig{
 		URL:        url,
 		OutputPath: outPath,

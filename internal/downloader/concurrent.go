@@ -29,7 +29,7 @@ var bufPool = sync.Pool{
 // ConcurrentDownloader handles multi-connection downloads
 type ConcurrentDownloader struct {
 	ProgressChan chan<- tea.Msg // Channel for events (start/complete/error)
-	ID           int            // Download ID
+	ID           string         // Download ID
 	State        *ProgressState // Shared state for TUI polling
 	activeTasks  map[int]*ActiveTask
 	activeMu     sync.Mutex
@@ -39,7 +39,7 @@ type ConcurrentDownloader struct {
 }
 
 // NewConcurrentDownloader creates a new concurrent downloader with all required parameters
-func NewConcurrentDownloader(id int, progressCh chan<- tea.Msg, state *ProgressState, runtime *RuntimeConfig) *ConcurrentDownloader {
+func NewConcurrentDownloader(id string, progressCh chan<- tea.Msg, state *ProgressState, runtime *RuntimeConfig) *ConcurrentDownloader {
 	return &ConcurrentDownloader{
 		ID:           id,
 		ProgressChan: progressCh,

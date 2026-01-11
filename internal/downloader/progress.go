@@ -8,7 +8,7 @@ import (
 )
 
 type ProgressState struct {
-	ID            int
+	ID            string
 	Downloaded    atomic.Int64
 	TotalSize     int64
 	StartTime     time.Time
@@ -22,7 +22,7 @@ type ProgressState struct {
 	mu                sync.Mutex // Protects TotalSize, StartTime, SessionStartBytes
 }
 
-func NewProgressState(id int, totalSize int64) *ProgressState {
+func NewProgressState(id string, totalSize int64) *ProgressState {
 	return &ProgressState{
 		ID:        id,
 		TotalSize: totalSize,

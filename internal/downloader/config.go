@@ -53,7 +53,7 @@ const (
 type DownloadConfig struct {
 	URL        string
 	OutputPath string
-	ID         int
+	ID         string
 	Filename   string
 	Verbose    bool
 	MD5Sum     string

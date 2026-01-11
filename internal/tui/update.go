@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/progress"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/google/uuid"
 )
 
 // notificationTickMsg is sent to check if a notification should be cleared
@@ -88,8 +89,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		nextID := m.NextDownloadID
-		m.NextDownloadID++
+		nextID := uuid.New().String()
 		newDownload := NewDownloadModel(nextID, msg.URL, "Queued", 0)
 		m.downloads = append(m.downloads, newDownload)
 
@@ -249,7 +249,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case messages.DownloadResumedMsg:
 		for _, d := range m.downloads {
-			if d.ID == msg.DownloadId {
+			if d.ID == msg.DownloadID {
 				d.paused = false
 				// Add log entry
 				m.addLogEntry(LogStyleStarted.Render("▶ Resumed: " + d.Filename))
@@ -538,8 +538,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = DashboardState
 
 				// Create download with state and reporter
-				nextID := m.NextDownloadID
-				m.NextDownloadID++
+				nextID := uuid.New().String()
 				newDownload := NewDownloadModel(nextID, url, "Queued", 0)
 				m.downloads = append(m.downloads, newDownload)
 
@@ -664,8 +663,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case DuplicateWarningState:
 			if msg.String() == "c" || msg.String() == "C" {
 				// Continue anyway - add the download
-				nextID := m.NextDownloadID
-				m.NextDownloadID++
+				nextID := uuid.New().String()
 				newDownload := NewDownloadModel(nextID, m.pendingURL, "Queued", 0)
 				m.downloads = append(m.downloads, newDownload)
 

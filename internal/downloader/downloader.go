@@ -18,13 +18,13 @@ import (
 type SingleDownloader struct {
 	Client       *http.Client
 	ProgressChan chan<- tea.Msg // Channel for events (start/complete/error)
-	ID           int            // Download ID
+	ID           string         // Download ID
 	State        *ProgressState // Shared state for TUI polling
 	Runtime      *RuntimeConfig
 }
 
 // NewSingleDownloader creates a new single-threaded downloader with all required parameters
-func NewSingleDownloader(id int, progressCh chan<- tea.Msg, state *ProgressState, runtime *RuntimeConfig) *SingleDownloader {
+func NewSingleDownloader(id string, progressCh chan<- tea.Msg, state *ProgressState, runtime *RuntimeConfig) *SingleDownloader {
 	return &SingleDownloader{
 		Client:       &http.Client{Timeout: 0},
 		ProgressChan: progressCh,

@@ -8,10 +8,10 @@ import (
 )
 
 func TestNewProgressState(t *testing.T) {
-	ps := NewProgressState(1, 1000000)
+	ps := NewProgressState("test-id-1", 1000000)
 
-	if ps.ID != 1 {
-		t.Errorf("ID = %d, want 1", ps.ID)
+	if ps.ID != "test-id-1" {
+		t.Errorf("ID = %s, want test-id-1", ps.ID)
 	}
 	if ps.TotalSize != 1000000 {
 		t.Errorf("TotalSize = %d, want 1000000", ps.TotalSize)
@@ -28,7 +28,7 @@ func TestNewProgressState(t *testing.T) {
 }
 
 func TestProgressState_SetTotalSize(t *testing.T) {
-	ps := NewProgressState(1, 0)
+	ps := NewProgressState("test-id-1", 0)
 	oldStartTime := ps.StartTime
 
 	// Small delay to ensure start time changes
@@ -45,7 +45,7 @@ func TestProgressState_SetTotalSize(t *testing.T) {
 }
 
 func TestProgressState_Downloaded(t *testing.T) {
-	ps := NewProgressState(1, 1000000)
+	ps := NewProgressState("test-id-1", 1000000)
 
 	// Simulate downloading
 	ps.Downloaded.Add(100000)
@@ -57,7 +57,7 @@ func TestProgressState_Downloaded(t *testing.T) {
 }
 
 func TestProgressState_ActiveWorkers(t *testing.T) {
-	ps := NewProgressState(1, 1000000)
+	ps := NewProgressState("test-id-1", 1000000)
 
 	ps.ActiveWorkers.Add(1)
 	ps.ActiveWorkers.Add(1)
@@ -74,7 +74,7 @@ func TestProgressState_ActiveWorkers(t *testing.T) {
 }
 
 func TestProgressState_Error(t *testing.T) {
-	ps := NewProgressState(1, 1000000)
+	ps := NewProgressState("test-id-1", 1000000)
 
 	// Initially no error
 	if ps.GetError() != nil {
@@ -94,7 +94,7 @@ func TestProgressState_Error(t *testing.T) {
 }
 
 func TestProgressState_PauseResume(t *testing.T) {
-	ps := NewProgressState(1, 1000000)
+	ps := NewProgressState("test-id-1", 1000000)
 
 	// Set up a cancel function
 	ctx, cancel := context.WithCancel(context.Background())
@@ -128,7 +128,7 @@ func TestProgressState_PauseResume(t *testing.T) {
 }
 
 func TestProgressState_GetProgress(t *testing.T) {
-	ps := NewProgressState(1, 1000000)
+	ps := NewProgressState("test-id-1", 1000000)
 	ps.Downloaded.Store(500000)
 	ps.ActiveWorkers.Store(4)
 
@@ -154,7 +154,7 @@ func TestProgressState_GetProgress(t *testing.T) {
 }
 
 func TestProgressState_Done(t *testing.T) {
-	ps := NewProgressState(1, 1000000)
+	ps := NewProgressState("test-id-1", 1000000)
 
 	if ps.Done.Load() {
 		t.Error("Should not be done initially")

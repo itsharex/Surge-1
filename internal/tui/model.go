@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/google/uuid"
 
 	"surge/internal/config"
 	"surge/internal/downloader"
@@ -45,7 +46,7 @@ type StartDownloadMsg struct {
 }
 
 type DownloadModel struct {
-	ID          int
+	ID          string
 	URL         string
 	Filename    string
 	Destination string // Full path to the destination file
@@ -69,15 +70,14 @@ type DownloadModel struct {
 }
 
 type RootModel struct {
-	downloads      []*DownloadModel
-	NextDownloadID int // Monotonic counter for unique download IDs
-	width          int
-	height         int
-	state          UIState
-	activeTab      int // 0=Queued, 1=Active, 2=Done
-	inputs         []textinput.Model
-	focusedInput   int
-	progressChan   chan tea.Msg // Channel for events only (start/complete/error)
+	downloads    []*DownloadModel
+	width        int
+	height       int
+	state        UIState
+	activeTab    int // 0=Queued, 1=Active, 2=Done
+	inputs       []textinput.Model
+	focusedInput int
+	progressChan chan tea.Msg // Channel for events only (start/complete/error)
 
 	// File picker for directory selection
 	filepicker filepicker.Model
@@ -121,7 +121,7 @@ type RootModel struct {
 }
 
 // NewDownloadModel creates a new download model with progress state and reporter
-func NewDownloadModel(id int, url string, filename string, total int64) *DownloadModel {
+func NewDownloadModel(id string, url string, filename string, total int64) *DownloadModel {
 	state := downloader.NewProgressState(id, total)
 	return &DownloadModel{
 		ID:        id,
@@ -174,8 +174,8 @@ func InitialRootModel() RootModel {
 	// Load paused downloads from master list (now uses global config directory)
 	var downloads []*DownloadModel
 	if pausedEntries, err := downloader.LoadPausedDownloads(); err == nil {
-		for i, entry := range pausedEntries {
-			id := i + 1 // Assign sequential IDs
+		for _, entry := range pausedEntries {
+			id := uuid.New().String() // Generate new UUID for each loaded download
 			dm := NewDownloadModel(id, entry.URL, entry.Filename, 0)
 			dm.paused = true
 			// Load actual progress from state file
@@ -196,7 +196,7 @@ func InitialRootModel() RootModel {
 	// Load completed downloads from master list (for Done tab persistence)
 	if completedEntries, err := downloader.LoadCompletedDownloads(); err == nil {
 		for _, entry := range completedEntries {
-			id := len(downloads) + 1
+			id := uuid.New().String() // Generate new UUID for each loaded download
 			dm := NewDownloadModel(id, entry.URL, entry.Filename, entry.TotalSize)
 			dm.done = true
 			dm.Downloaded = entry.TotalSize
@@ -222,21 +222,20 @@ func InitialRootModel() RootModel {
 	settingsInput.Prompt = ""
 
 	return RootModel{
-		downloads:      downloads,
-		NextDownloadID: len(downloads) + 1, // Start after loaded downloads
-		inputs:         []textinput.Model{urlInput, pathInput, filenameInput},
-		state:          DashboardState,
-		progressChan:   progressChan,
-		filepicker:     fp,
-		help:           helpModel,
-		list:           downloadList,
-		Pool:           downloader.NewWorkerPool(progressChan),
-		PWD:            pwd,
-		SpeedHistory:   make([]float64, GraphHistoryPoints), // 60 points of history (30s at 0.5s interval)
-		logViewport:    viewport.New(40, 5),                 // Default size, will be resized
-		logEntries:     make([]string, 0),
-		Settings:       settings,
-		SettingsInput:  settingsInput,
+		downloads:     downloads,
+		inputs:        []textinput.Model{urlInput, pathInput, filenameInput},
+		state:         DashboardState,
+		progressChan:  progressChan,
+		filepicker:    fp,
+		help:          helpModel,
+		list:          downloadList,
+		Pool:          downloader.NewWorkerPool(progressChan),
+		PWD:           pwd,
+		SpeedHistory:  make([]float64, GraphHistoryPoints), // 60 points of history (30s at 0.5s interval)
+		logViewport:   viewport.New(40, 5),                 // Default size, will be resized
+		logEntries:    make([]string, 0),
+		Settings:      settings,
+		SettingsInput: settingsInput,
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"surge/internal/utils"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 )
 
@@ -31,7 +32,7 @@ func runHeadless(ctx context.Context, url, outPath string, verbose bool, md5sum,
 	// Start download in background
 	errCh := make(chan error, 1)
 	go func() {
-		err := downloader.Download(ctx, url, outPath, verbose, md5sum, sha256sum, eventCh, 1)
+		err := downloader.Download(ctx, url, outPath, verbose, md5sum, sha256sum, eventCh, uuid.New().String())
 		errCh <- err
 		close(eventCh)
 	}()

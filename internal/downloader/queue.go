@@ -19,7 +19,7 @@ type activeDownload struct {
 type WorkerPool struct {
 	taskChan   chan DownloadConfig
 	progressCh chan<- tea.Msg
-	downloads  map[int]*activeDownload // Track active downloads for pause/resume
+	downloads  map[string]*activeDownload // Track active downloads for pause/resume
 	mu         sync.RWMutex
 }
 
@@ -27,7 +27,7 @@ func NewWorkerPool(progressCh chan<- tea.Msg) *WorkerPool {
 	pool := &WorkerPool{
 		taskChan:   make(chan DownloadConfig, 100), //We make it buffered to avoid blocking add
 		progressCh: progressCh,
-		downloads:  make(map[int]*activeDownload),
+		downloads:  make(map[string]*activeDownload),
 	}
 	for i := 0; i < maxDownloads; i++ {
 		go pool.worker()
@@ -40,7 +40,7 @@ func (p *WorkerPool) Add(cfg DownloadConfig) {
 }
 
 // Pause pauses a specific download by ID
-func (p *WorkerPool) Pause(downloadID int) {
+func (p *WorkerPool) Pause(downloadID string) {
 	p.mu.RLock()
 	ad, exists := p.downloads[downloadID]
 	p.mu.RUnlock()
@@ -70,7 +70,7 @@ func (p *WorkerPool) Pause(downloadID int) {
 // PauseAll pauses all active downloads (for graceful shutdown)
 func (p *WorkerPool) PauseAll() {
 	p.mu.RLock()
-	ids := make([]int, 0, len(p.downloads))
+	ids := make([]string, 0, len(p.downloads))
 	for id, ad := range p.downloads {
 		// Only pause downloads that are actually active (not already paused or done)
 		if ad != nil && ad.config.State != nil && !ad.config.State.IsPaused() && !ad.config.State.Done.Load() {
@@ -85,7 +85,7 @@ func (p *WorkerPool) PauseAll() {
 }
 
 // Cancel cancels and removes a download by ID
-func (p *WorkerPool) Cancel(downloadID int) {
+func (p *WorkerPool) Cancel(downloadID string) {
 	p.mu.Lock()
 	ad, exists := p.downloads[downloadID]
 	if exists {
@@ -109,7 +109,7 @@ func (p *WorkerPool) Cancel(downloadID int) {
 }
 
 // Resume resumes a paused download by ID
-func (p *WorkerPool) Resume(downloadID int) {
+func (p *WorkerPool) Resume(downloadID string) {
 	p.mu.RLock()
 	ad, exists := p.downloads[downloadID]
 	p.mu.RUnlock()
@@ -129,7 +129,7 @@ func (p *WorkerPool) Resume(downloadID int) {
 	// Send resume message
 	if p.progressCh != nil {
 		p.progressCh <- messages.DownloadResumedMsg{
-			DownloadId: downloadID,
+			DownloadID: downloadID,
 		}
 	}
 }
