@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Surge Download Manager",
+  "name": "Surge",
   "version": "1.0.0",
-  "description": "Intercept downloads and send them to Surge download manager",
+  "description": "Intercept downloads and send them to Surge (https://github.com/JunaidIslam2105/surge)",
   "permissions": [
     "downloads",
     "storage",

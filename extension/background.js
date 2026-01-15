@@ -110,13 +110,6 @@ chrome.downloads.onCreated.addListener(async (downloadItem) => {
     const surgeRunning = await checkSurgeHealth();
     if (!surgeRunning) {
         console.log("[Surge] Server not running, using browser download");
-        // Show notification to user
-        chrome.notifications.create({
-            type: "basic",
-            iconUrl: "icons/icon48.png",
-            title: "Surge Not Running",
-            message: "Download proceeding in browser. Start Surge with: surge server",
-        });
         return;
     }
 
