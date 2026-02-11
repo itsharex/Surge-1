@@ -323,7 +323,7 @@ func (m *RootModel) setGeneralSetting(key, value, typ string) error {
 	return nil
 }
 
-func (m *RootModel) setConnectionsSetting(key, value, typ string) error {
+func (m *RootModel) setNetworkSetting(key, value, typ string) error {
 	switch key {
 	case "max_connections_per_host":
 		if v, err := strconv.Atoi(value); err == nil {
@@ -353,12 +353,6 @@ func (m *RootModel) setConnectionsSetting(key, value, typ string) error {
 			b, _ := strconv.ParseBool(value)
 			m.Settings.Network.SequentialDownload = b
 		}
-	}
-	return nil
-}
-
-func (m *RootModel) setNetworkSetting(key, value, typ string) error {
-	switch key {
 	case "min_chunk_size":
 		// Parse as MB and convert to bytes
 		if v, err := strconv.ParseFloat(value, 64); err == nil {
