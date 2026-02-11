@@ -37,7 +37,7 @@ func TestDefaultSettings(t *testing.T) {
 	})
 
 	// Verify Connection settings
-	t.Run("ConnectionSettings", func(t *testing.T) {
+	t.Run("NetworkSettings", func(t *testing.T) {
 		if settings.Network.MaxConnectionsPerHost <= 0 {
 			t.Errorf("MaxConnectionsPerHost should be positive, got: %d", settings.Network.MaxConnectionsPerHost)
 		}
