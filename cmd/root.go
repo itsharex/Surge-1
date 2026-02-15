@@ -52,8 +52,8 @@ var (
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:     "surge [url]...",
-	Short:   "An open-source download manager written in Go",
-	Long:    `Surge is a blazing fast, open-source terminal (TUI) download manager built in Go.`,
+	Short:   "Blazing fast TUI download manager built in Go for power users",
+	Long:    `Surge is a blazing fast TUI download manager built in Go for power users. Find more info here: https://github.com/surge-downloader/surge`,
 	Version: Version,
 	Args:    cobra.ArbitraryArgs,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
