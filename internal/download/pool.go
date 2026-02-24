@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/surge-downloader/surge/internal/engine/events"
@@ -16,6 +17,8 @@ import (
 type activeDownload struct {
 	config types.DownloadConfig
 	cancel context.CancelFunc
+	// running is true while the worker goroutine is executing TUIDownload for this config.
+	running atomic.Bool
 }
 
 type WorkerPool struct {
@@ -27,6 +30,17 @@ type WorkerPool struct {
 	wg           sync.WaitGroup // We use this to wait for all active downloads to pause before exiting the program
 	maxDownloads int
 }
+
+var (
+	// gracefulShutdownPauseSoftTimeout controls when we emit a warning that
+	// pausing is taking longer than expected. It is intentionally soft; shutdown
+	// continues waiting for durable pause persistence.
+	gracefulShutdownPauseSoftTimeout = 10 * time.Second
+	// gracefulShutdownPausePollInterval controls how often shutdown rechecks pause state.
+	gracefulShutdownPausePollInterval = 100 * time.Millisecond
+	// gracefulShutdownPauseHardTimeout prevents indefinite shutdown hangs if a worker is stuck.
+	gracefulShutdownPauseHardTimeout = 30 * time.Second
+)
 
 func NewWorkerPool(progressCh chan<- any, maxDownloads int) *WorkerPool {
 	if maxDownloads < 1 {
@@ -273,16 +287,18 @@ func (p *WorkerPool) worker() {
 		ctx, cancel := context.WithCancel(context.Background())
 
 		// Register active download
-		ad := &activeDownload{
-			config: cfg,
-			cancel: cancel,
-		}
-		p.mu.Lock()
-		delete(p.queued, cfg.ID)
-		p.downloads[cfg.ID] = ad
-		p.mu.Unlock()
+			ad := &activeDownload{
+				config: cfg,
+				cancel: cancel,
+			}
+			ad.running.Store(true)
+			p.mu.Lock()
+			delete(p.queued, cfg.ID)
+			p.downloads[cfg.ID] = ad
+			p.mu.Unlock()
 
-		err := TUIDownload(ctx, &ad.config)
+			err := TUIDownload(ctx, &ad.config)
+			ad.running.Store(false)
 
 		// Logic:
 		// 1. If Pause() was called: State.IsPaused() is true. We keep the task in p.downloads (so it can be resumed).
@@ -426,17 +442,22 @@ func (p *WorkerPool) GracefulShutdown() {
 
 	// Wait for any downloads in "Pausing" state to finish transitioning
 	// This ensures we don't exit while a database write is pending/active
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(gracefulShutdownPausePollInterval)
 	defer ticker.Stop()
+	start := time.Now()
+	warned := false
 
 	for {
 		p.mu.RLock()
 		stillPausing := false
 		for _, ad := range p.downloads {
 			if ad.config.State != nil && ad.config.State.IsPausing() {
+				// If no worker is running this download anymore, pausing is stale.
+				// Normalize it so shutdown can proceed.
+				if !ad.running.Load() {
+					ad.config.State.SetPausing(false)
+					continue
+				}
 				stillPausing = true
 				break
 			}
@@ -447,13 +468,15 @@ func (p *WorkerPool) GracefulShutdown() {
 			break
 		}
 
-		select {
-		case <-ctx.Done():
-			utils.Debug("GracefulShutdown: timed out waiting for downloads to pause")
-			return // Return from function, loop will exit
-		case <-ticker.C:
-			continue
+		if !warned && time.Since(start) >= gracefulShutdownPauseSoftTimeout {
+			utils.Debug("GracefulShutdown: downloads still pausing after %v, continuing to wait for durable pause", gracefulShutdownPauseSoftTimeout)
+			warned = true
 		}
+		if time.Since(start) >= gracefulShutdownPauseHardTimeout {
+			utils.Debug("GracefulShutdown: forcing exit from pausing wait after hard timeout %v", gracefulShutdownPauseHardTimeout)
+			break
+		}
+		<-ticker.C
 	}
 
 	p.wg.Wait() // Blocks until all workers call Done()

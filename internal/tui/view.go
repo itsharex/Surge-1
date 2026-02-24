@@ -65,6 +65,21 @@ func (m RootModel) View() string {
 		return "Loading..."
 	}
 
+	if m.shuttingDown {
+		modal := components.ConfirmationModal{
+			Title:       "Shutting Down",
+			Message:     "Pausing downloads and saving resume state...",
+			Detail:      "Please wait",
+			Keys:        components.ConfirmationKeyMap{},
+			Help:        m.help,
+			BorderColor: ColorNeonCyan,
+			Width:       60,
+			Height:      10,
+		}
+		box := modal.RenderWithBtopBox(renderBtopBox, PaneTitleStyle)
+		return m.renderModalWithOverlay(box)
+	}
+
 	// === Handle Modal States First ===
 	// These overlays sit on top of the dashboard or replace it
 
@@ -799,7 +814,10 @@ func renderFocusedDetails(d *DownloadModel, w int) string {
 
 	// Speed & ETA
 	if d.done {
-		if d.Speed > 0 {
+		if elapsed.Seconds() >= 1 {
+			avgSpeed := float64(d.Total) / float64(int(elapsed.Seconds()))
+			speedStr = fmt.Sprintf("%.2f MB/s (Avg)", avgSpeed/Megabyte)
+		} else if d.Speed > 0 {
 			speedStr = fmt.Sprintf("%.2f MB/s (Avg)", d.Speed/Megabyte)
 		} else if elapsed.Seconds() > 0 {
 			avgSpeed := float64(d.Total) / elapsed.Seconds()

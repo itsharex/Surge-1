@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/surge-downloader/surge/internal/engine/types"
@@ -62,10 +63,15 @@ func (d *ConcurrentDownloader) worker(ctx context.Context, id int, mirrors []str
 			taskCtx, taskCancel := context.WithCancel(ctx)
 			now := time.Now()
 			activeTask := &ActiveTask{
-				Task:        task,
-				StartTime:   now,
-				Cancel:      taskCancel,
-				WindowStart: now, // Initialize sliding window
+				Task:            task,
+				StartTime:       now,
+				Cancel:          taskCancel,
+				WindowStart:     now, // Initialize sliding window
+				SharedMaxOffset: task.SharedMaxOffset,
+			}
+			if task.SharedMaxOffset != nil {
+				// Prevent infinite hedging of hedged tasks.
+				activeTask.Hedged.Store(1)
 			}
 			activeTask.CurrentOffset.Store(task.Offset)
 			activeTask.StopAt.Store(task.Offset + task.Length)
@@ -278,6 +284,11 @@ func (d *ConcurrentDownloader) downloadTask(ctx context.Context, rawurl string, 
 			n, err := resp.Body.Read(buf[readSoFar:readSize])
 			if n > 0 {
 				readSoFar += n
+				// CONTINUOUS HEALTH KEEPALIVE:
+				// Update LastActivity directly off the TCP socket instead of waiting for the buffer
+				// to completely fill and hit disk. This prevents the Health Monitor from killing
+				// workers on slightly slower networks during the 500KB buffer acquisition.
+				activeTask.LastActivity.Store(time.Now().UnixNano())
 			}
 			if err != nil {
 				readErr = err
@@ -309,17 +320,46 @@ func (d *ConcurrentDownloader) downloadTask(ctx context.Context, rawurl string, 
 			now := time.Now()
 			rangeStart := offset // Start of this write
 			offset += int64(readSoFar)
+
+			// Compute newly written bytes deduplicated across racing workers
+			var newlyWritten int64
+			if activeTask.SharedMaxOffset != nil {
+				for {
+					maxOff := activeTask.SharedMaxOffset.Load()
+					if offset <= maxOff {
+						// This exact byte range was already reported by the racing worker!
+						newlyWritten = 0
+						break
+					}
+					if rangeStart >= maxOff {
+						// Entirely new progress
+						if activeTask.SharedMaxOffset.CompareAndSwap(maxOff, offset) {
+							newlyWritten = int64(readSoFar)
+							break
+						}
+					} else {
+						// Partially new progress
+						if activeTask.SharedMaxOffset.CompareAndSwap(maxOff, offset) {
+							newlyWritten = offset - maxOff
+							break
+						}
+					}
+				}
+			} else {
+				newlyWritten = int64(readSoFar)
+			}
+
 			activeTask.CurrentOffset.Store(offset)
-			activeTask.WindowBytes.Add(int64(readSoFar))
+			activeTask.WindowBytes.Add(newlyWritten)
 			activeTask.LastActivity.Store(now.UnixNano())
 
-			// Calculate effective contribution (clamping to StopAt is done above via readSoFar truncation)
-			// So readSoFar is exactly what we wrote and what we "own"
-
-			if pendingStart == -1 {
-				pendingStart = rangeStart
+			// Calculate effective contribution
+			if newlyWritten > 0 {
+				if pendingStart == -1 {
+					pendingStart = offset - newlyWritten
+				}
+				pendingBytes += newlyWritten
 			}
-			pendingBytes += int64(readSoFar)
 
 			// Check thresholds
 			if pendingBytes >= batchSizeThreshold || now.Sub(lastUpdate) >= batchTimeThreshold {
@@ -474,9 +514,18 @@ func (d *ConcurrentDownloader) HedgeWork(queue *TaskQueue) bool {
 		return false
 	}
 
+	// Initialize the shared deduplication state for both tasks
+	if bestActive.SharedMaxOffset == nil {
+		maxOff := &atomic.Int64{}
+		maxOff.Store(current)
+		bestActive.SharedMaxOffset = maxOff
+	}
+
+	// Create a duplicate task for the remaining byte range
 	hedgedTask := types.Task{
-		Offset: current,
-		Length: stopAt - current,
+		Offset:          current,
+		Length:          stopAt - current,
+		SharedMaxOffset: bestActive.SharedMaxOffset,
 	}
 
 	queue.Push(hedgedTask)
