@@ -2,6 +2,7 @@ package single
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -133,6 +134,34 @@ func TestCopyFile_ContentVerification(t *testing.T) {
 	}
 }
 
+func TestPreallocateFile(t *testing.T) {
+	tmpDir, cleanup, err := testutil.TempDir("surge-prealloc-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	filePath := filepath.Join(tmpDir, "prealloc.bin")
+	file, err := os.Create(filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = file.Close() }()
+
+	const size = int64(2 * types.MB)
+	if err := preallocateFile(file, size); err != nil {
+		t.Fatalf("preallocateFile failed: %v", err)
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != size {
+		t.Fatalf("file size = %d, want %d", info.Size(), size)
+	}
+}
+
 // =============================================================================
 // SingleDownloader - Streaming Server
 // =============================================================================
@@ -257,6 +286,41 @@ func TestNewSingleDownloader(t *testing.T) {
 	}
 	if downloader.State != state {
 		t.Error("State not set correctly")
+	}
+}
+
+func TestNewSingleDownloader_TransportReuse(t *testing.T) {
+	runtime := &types.RuntimeConfig{MaxConnectionsPerHost: 8}
+	d1 := NewSingleDownloader("test-id-1", nil, nil, runtime)
+	d2 := NewSingleDownloader("test-id-2", nil, nil, runtime)
+
+	t1, ok := d1.Client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected downloader client transport to be *http.Transport")
+	}
+	t2, ok := d2.Client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected downloader client transport to be *http.Transport")
+	}
+	if t1 != t2 {
+		t.Fatal("expected transport reuse for identical runtime config")
+	}
+}
+
+func TestNewSingleDownloader_TransportIsolationByProxy(t *testing.T) {
+	d1 := NewSingleDownloader("test-id-1", nil, nil, &types.RuntimeConfig{ProxyURL: "http://127.0.0.1:8080"})
+	d2 := NewSingleDownloader("test-id-2", nil, nil, &types.RuntimeConfig{ProxyURL: "http://127.0.0.1:9090"})
+
+	t1, ok := d1.Client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected downloader client transport to be *http.Transport")
+	}
+	t2, ok := d2.Client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("expected downloader client transport to be *http.Transport")
+	}
+	if t1 == t2 {
+		t.Fatal("expected different transports for different proxy settings")
 	}
 }
 
@@ -492,5 +556,40 @@ func TestSingleDownloader_Download_ContentIntegrity(t *testing.T) {
 	}
 	if allZero {
 		t.Error("Content should not be all zeros with random data")
+	}
+}
+
+// =============================================================================
+// Benchmarks
+// =============================================================================
+
+func BenchmarkSingleDownloader(b *testing.B) {
+	tmpDir, cleanup, _ := testutil.TempDir("surge-bench-single")
+	defer cleanup()
+
+	fileSize := int64(10 * types.MB)
+	server := testutil.NewMockServer(
+		testutil.WithFileSize(fileSize),
+		testutil.WithRangeSupport(false),
+	)
+	defer server.Close()
+
+	destPath := filepath.Join(tmpDir, "bench_single.bin")
+	state := types.NewProgressState("bench-single", fileSize)
+	runtime := &types.RuntimeConfig{}
+
+	downloader := NewSingleDownloader("bench-id", nil, state, runtime)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := downloader.Download(ctx, server.URL(), destPath, fileSize, "bench.bin")
+		if err != nil {
+			b.Fatalf("Download failed: %v", err)
+		}
+		cancel()
+		_ = os.Remove(destPath)
 	}
 }

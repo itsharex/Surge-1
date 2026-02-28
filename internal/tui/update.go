@@ -81,7 +81,8 @@ func openFile(path string) error {
 	return cmd.Start()
 }
 
-// readURLsFromFile reads URLs from a file, one per line (skips empty lines, comments, and duplicates)
+// readURLsFromFile reads URLs from a file, accepting one-per-line or whitespace-separated URLs.
+// It skips comments and duplicate URLs.
 func readURLsFromFile(filepath string) ([]string, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
@@ -96,15 +97,25 @@ func readURLsFromFile(filepath string) ([]string, error) {
 	var urls []string
 	seen := make(map[string]bool)
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		// Skip empty lines and comments
-		if line != "" && !strings.HasPrefix(line, "#") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+		}
+		if line == "" {
+			continue
+		}
+
+		for _, token := range strings.Fields(line) {
 			// Normalize URL for duplicate detection
-			normalized := strings.TrimRight(line, "/")
+			normalized := strings.TrimRight(token, "/")
 			if !seen[normalized] {
 				seen[normalized] = true
-				urls = append(urls, line)
+				urls = append(urls, token)
 			}
 		}
 	}
@@ -369,13 +380,22 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case events.DownloadErrorMsg:
+		found := false
 		for _, d := range m.downloads {
 			if d.ID == msg.DownloadID {
 				d.err = msg.Err
 				d.done = true
 				m.addLogEntry(LogStyleError.Render("✖ Error: " + d.Filename))
+				found = true
 				break
 			}
+		}
+		if !found {
+			newDownload := NewDownloadModel(msg.DownloadID, "", msg.Filename, 0)
+			newDownload.err = msg.Err
+			newDownload.done = true
+			m.downloads = append(m.downloads, newDownload)
+			m.addLogEntry(LogStyleError.Render("✖ Error: " + msg.Filename))
 		}
 		m.UpdateListItems()
 		return m, tea.Batch(cmds...)

@@ -3,6 +3,8 @@ package tui
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,15 +73,34 @@ func TestResume_RespectsOriginalPath_WhenDefaultChanges(t *testing.T) {
 	dm := m.downloads[0]
 
 	expectedPathA := filepath.Join(dirA, testFilename)
+	canonicalForCompare := func(p string) string {
+		p = filepath.Clean(p)
+		if eval, err := filepath.EvalSymlinks(p); err == nil {
+			p = eval
+		} else {
+			// Files may not exist yet; resolve symlinks on parent directory if possible.
+			dir := filepath.Dir(p)
+			base := filepath.Base(p)
+			if evalDir, dirErr := filepath.EvalSymlinks(dir); dirErr == nil {
+				p = filepath.Join(evalDir, base)
+			}
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		p = filepath.Clean(p)
+		if runtime.GOOS == "windows" {
+			p = strings.ToLower(p)
+		}
+		return p
+	}
+	sameResolvedPath := func(a, b string) bool {
+		return canonicalForCompare(a) == canonicalForCompare(b)
+	}
 
 	// We expect the Destination to be absolute path
-	if dm.Destination != expectedPathA {
-		// Resolve symlinks just in case
-		evalA, _ := filepath.EvalSymlinks(expectedPathA)
-		evalDest, _ := filepath.EvalSymlinks(dm.Destination)
-		if evalDest != evalA {
-			t.Errorf("Initial download path mismatch.\nGot:  %s\nWant: %s", dm.Destination, expectedPathA)
-		}
+	if !sameResolvedPath(dm.Destination, expectedPathA) {
+		t.Errorf("Initial download path mismatch.\nGot:  %s\nWant: %s", dm.Destination, expectedPathA)
 	}
 
 	// 5. Simulate "Pause" / Persistence
@@ -119,7 +140,7 @@ func TestResume_RespectsOriginalPath_WhenDefaultChanges(t *testing.T) {
 
 	// 8. The CRITICAL CHECK
 	// The loaded entry.DestPath MUST be DirA, not DirB
-	if entry.DestPath != expectedPathA {
+	if !sameResolvedPath(entry.DestPath, expectedPathA) {
 		t.Errorf("Resumed path incorrect.\nGot:  %s\nWant: %s", entry.DestPath, expectedPathA)
 	}
 

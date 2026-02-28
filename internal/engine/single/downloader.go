@@ -4,15 +4,16 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/surge-downloader/surge/internal/engine/types"
 	"github.com/surge-downloader/surge/internal/utils"
 )
-
-const singleProgressPublishStride = 64 * 1024
 
 // SingleDownloader handles single-threaded downloads for servers that don't support range requests.
 // NOTE: Pause/resume is NOT supported because this downloader is only used when
@@ -26,10 +27,28 @@ type SingleDownloader struct {
 	Headers      map[string]string // Custom HTTP headers (cookies, auth, etc.)
 }
 
+type singleTransportKey struct {
+	proxyURL string
+	maxConns int
+}
+
+var singleTransportCache sync.Map // map[singleTransportKey]*http.Transport
+
+var bufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
 // NewSingleDownloader creates a new single-threaded downloader with all required parameters
 func NewSingleDownloader(id string, progressCh chan<- any, state *types.ProgressState, runtime *types.RuntimeConfig) *SingleDownloader {
+	if runtime == nil {
+		runtime = &types.RuntimeConfig{}
+	}
+
 	return &SingleDownloader{
-		Client:       &http.Client{Timeout: 0},
+		Client:       newSingleClient(runtime),
 		ProgressChan: progressCh,
 		ID:           id,
 		State:        state,
@@ -37,10 +56,75 @@ func NewSingleDownloader(id string, progressCh chan<- any, state *types.Progress
 	}
 }
 
+func newSingleClient(runtime *types.RuntimeConfig) *http.Client {
+	transport := getSharedSingleTransport(runtime)
+
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			if len(via) > 0 {
+				for key, vals := range via[0].Header {
+					req.Header[key] = vals
+				}
+			}
+			return nil
+		},
+	}
+}
+
+func getSharedSingleTransport(runtime *types.RuntimeConfig) *http.Transport {
+	key := singleTransportKey{
+		proxyURL: runtime.ProxyURL,
+		maxConns: runtime.GetMaxConnectionsPerHost(),
+	}
+
+	if cached, ok := singleTransportCache.Load(key); ok {
+		return cached.(*http.Transport)
+	}
+
+	transport := newSingleTransport(runtime)
+	actual, _ := singleTransportCache.LoadOrStore(key, transport)
+	return actual.(*http.Transport)
+}
+
+func newSingleTransport(runtime *types.RuntimeConfig) *http.Transport {
+	proxyFunc := http.ProxyFromEnvironment
+	if runtime.ProxyURL != "" {
+		if parsedURL, err := url.Parse(runtime.ProxyURL); err == nil {
+			proxyFunc = http.ProxyURL(parsedURL)
+		} else {
+			utils.Debug("Invalid proxy URL %s: %v", runtime.ProxyURL, err)
+		}
+	}
+
+	return &http.Transport{
+		MaxIdleConns:        types.DefaultMaxIdleConns,
+		MaxIdleConnsPerHost: runtime.GetMaxConnectionsPerHost(),
+		MaxConnsPerHost:     runtime.GetMaxConnectionsPerHost(),
+		Proxy:               proxyFunc,
+
+		IdleConnTimeout:       types.DefaultIdleConnTimeout,
+		TLSHandshakeTimeout:   types.DefaultTLSHandshakeTimeout,
+		ResponseHeaderTimeout: types.DefaultResponseHeaderTimeout,
+		ExpectContinueTimeout: types.DefaultExpectContinueTimeout,
+
+		DisableCompression: true,
+		DialContext: (&net.Dialer{
+			Timeout:   types.DialTimeout,
+			KeepAlive: types.KeepAliveDuration,
+		}).DialContext,
+	}
+}
+
 // Download downloads a file using a single connection.
 // This is used for servers that don't support Range requests.
 // If interrupted, the download cannot be resumed and must restart from the beginning.
 func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string, fileSize int64, filename string) error {
+	defer d.Client.CloseIdleConnections()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawurl, nil)
 	if err != nil {
 		return err
@@ -55,7 +139,6 @@ func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string
 	if err != nil {
 		return err
 	}
-	defer d.Client.CloseIdleConnections()
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
 			utils.Debug("Error closing response body: %v", err)
@@ -73,6 +156,14 @@ func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string
 		return err
 	}
 
+	preallocated := false
+	if fileSize > 0 {
+		if err := preallocateFile(outFile, fileSize); err != nil {
+			return fmt.Errorf("failed to preallocate file: %w", err)
+		}
+		preallocated = true
+	}
+
 	// Track whether we completed successfully for cleanup
 	success := false
 	defer func() {
@@ -83,46 +174,29 @@ func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string
 	}()
 
 	start := time.Now()
-
-	// Copy response body to file with context cancellation support
 	var written int64
-	var lastPublished int64
-	buf := make([]byte, d.Runtime.GetWorkerBufferSize())
 
-	for {
-		// Check for context cancellation (allows clean shutdown)
-		select {
-		case <-ctx.Done():
-			// Can't resume - server doesn't support Range requests
-			return ctx.Err()
-		default:
-		}
+	bufPtr := bufPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer bufPool.Put(bufPtr)
 
-		nr, readErr := resp.Body.Read(buf)
-		if nr > 0 {
-			nw, writeErr := outFile.Write(buf[0:nr])
-				if nw > 0 {
-					written += int64(nw)
-					if d.State != nil {
-						if written-lastPublished >= singleProgressPublishStride {
-							d.State.Downloaded.Store(written)
-							d.State.VerifiedProgress.Store(written)
-							lastPublished = written
-						}
-					}
-				}
-			if writeErr != nil {
-				return fmt.Errorf("write error: %w", writeErr)
-			}
-			if nr != nw {
-				return io.ErrShortWrite
-			}
+	if d.State == nil {
+		written, err = io.CopyBuffer(outFile, resp.Body, buf)
+	} else {
+		progressReader := newProgressReader(resp.Body, d.State, types.WorkerBatchSize, types.WorkerBatchInterval)
+		written, err = io.CopyBuffer(outFile, progressReader, buf)
+		progressReader.Flush()
+	}
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
 		}
-		if readErr != nil {
-			if readErr == io.EOF {
-				break // Done reading
-			}
-			return fmt.Errorf("read error: %w", readErr)
+		return fmt.Errorf("copy error: %w", err)
+	}
+
+	if preallocated && written != fileSize {
+		if err := outFile.Truncate(written); err != nil {
+			return fmt.Errorf("truncate error: %w", err)
 		}
 	}
 
@@ -150,7 +224,10 @@ func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string
 	success = true // Mark successful so defer doesn't clean up
 
 	elapsed := time.Since(start)
-	speed := float64(written) / elapsed.Seconds()
+	speed := 0.0
+	if elapsed > 0 {
+		speed = float64(written) / elapsed.Seconds()
+	}
 	utils.Debug("\nDownloaded %s in %s (%s/s)\n",
 		destPath,
 		elapsed.Round(time.Second),
@@ -158,6 +235,82 @@ func (d *SingleDownloader) Download(ctx context.Context, rawurl, destPath string
 	)
 
 	return nil
+}
+
+type progressReader struct {
+	reader        io.Reader
+	state         *types.ProgressState
+	batchSize     int64
+	batchInterval time.Duration
+	written       int64
+	pending       int64
+	lastFlush     time.Time
+	readChecks    uint8
+}
+
+func newProgressReader(reader io.Reader, state *types.ProgressState, batchSize int64, batchInterval time.Duration) *progressReader {
+	if batchSize <= 0 {
+		batchSize = types.WorkerBatchSize
+	}
+	return &progressReader{
+		reader:        reader,
+		state:         state,
+		batchSize:     batchSize,
+		batchInterval: batchInterval,
+		lastFlush:     time.Now(),
+	}
+}
+
+func (w *progressReader) Read(p []byte) (int, error) {
+	n, err := w.reader.Read(p)
+	if n <= 0 || w.state == nil {
+		return n, err
+	}
+
+	written := int64(n)
+	w.written += written
+	w.pending += written
+	if w.pending >= w.batchSize {
+		w.flushWithTime(time.Now())
+		return n, err
+	}
+
+	if w.batchInterval > 0 {
+		// Check wall-clock interval periodically to avoid calling time.Now on every read.
+		w.readChecks++
+		if w.readChecks >= 8 {
+			now := time.Now()
+			if now.Sub(w.lastFlush) >= w.batchInterval {
+				w.flushWithTime(now)
+			}
+			w.readChecks = 0
+		}
+	}
+
+	return n, err
+}
+
+func (w *progressReader) Flush() {
+	w.flushWithTime(time.Now())
+}
+
+func (w *progressReader) flushWithTime(now time.Time) {
+	if w.state == nil {
+		w.pending = 0
+		w.lastFlush = now
+		w.readChecks = 0
+		return
+	}
+
+	if w.pending == 0 && w.written == 0 {
+		return
+	}
+
+	w.state.Downloaded.Store(w.written)
+	w.state.VerifiedProgress.Store(w.written)
+	w.pending = 0
+	w.lastFlush = now
+	w.readChecks = 0
 }
 
 // copyFile copies a file from src to dst (fallback when rename fails)

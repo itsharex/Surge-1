@@ -161,6 +161,7 @@ func TestWorkerPool_Pause_ActiveDownload(t *testing.T) {
 func TestWorkerPool_Pause_NilState(t *testing.T) {
 	ch := make(chan any, 10)
 	pool := NewWorkerPool(ch, 3)
+	canceled := make(chan struct{}, 1)
 
 	// Add download with nil state
 	pool.mu.Lock()
@@ -168,6 +169,12 @@ func TestWorkerPool_Pause_NilState(t *testing.T) {
 		config: types.DownloadConfig{
 			ID:    "test-id",
 			State: nil,
+		},
+		cancel: func() {
+			select {
+			case canceled <- struct{}{}:
+			default:
+			}
 		},
 	}
 	pool.mu.Unlock()
@@ -187,6 +194,13 @@ func TestWorkerPool_Pause_NilState(t *testing.T) {
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Error("Expected pause message to be sent")
+	}
+
+	select {
+	case <-canceled:
+		// expected
+	case <-time.After(100 * time.Millisecond):
+		t.Error("Expected pause to cancel worker context")
 	}
 }
 
@@ -480,6 +494,45 @@ func TestWorkerPool_Cancel_DoesNotRemoveIncompleteFile(t *testing.T) {
 
 	if _, err := os.Stat(incompletePath); err != nil {
 		t.Fatalf("expected .surge file to remain for centralized delete cleanup, stat err: %v", err)
+	}
+}
+
+func TestWorkerPool_Cancel_QueuedDownload_RemovesFromQueueAndEmitsEvent(t *testing.T) {
+	ch := make(chan any, 10)
+	pool := &WorkerPool{
+		progressCh: ch,
+		downloads:  make(map[string]*activeDownload),
+		queued: map[string]types.DownloadConfig{
+			"queued-id": {
+				ID:       "queued-id",
+				Filename: "queued.bin",
+			},
+		},
+	}
+
+	pool.Cancel("queued-id")
+
+	pool.mu.RLock()
+	_, exists := pool.queued["queued-id"]
+	pool.mu.RUnlock()
+	if exists {
+		t.Fatal("expected queued download to be removed from queue")
+	}
+
+	select {
+	case msg := <-ch:
+		removed, ok := msg.(events.DownloadRemovedMsg)
+		if !ok {
+			t.Fatalf("expected DownloadRemovedMsg, got %T", msg)
+		}
+		if removed.DownloadID != "queued-id" {
+			t.Fatalf("removed id = %q, want queued-id", removed.DownloadID)
+		}
+		if removed.Filename != "queued.bin" {
+			t.Fatalf("removed filename = %q, want queued.bin", removed.Filename)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected removal message for queued cancel")
 	}
 }
 

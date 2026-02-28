@@ -41,6 +41,10 @@ var (
 	gracefulShutdownPausePollInterval = 100 * time.Millisecond
 	// gracefulShutdownPauseHardTimeout prevents indefinite shutdown hangs if a worker is stuck.
 	gracefulShutdownPauseHardTimeout = 30 * time.Second
+	// cancelStopWaitTimeout bounds how long Cancel waits for an active worker to exit.
+	cancelStopWaitTimeout = 3 * time.Second
+	// cancelStopPollInterval controls polling cadence while waiting for cancel to take effect.
+	cancelStopPollInterval = 10 * time.Millisecond
 )
 
 func NewWorkerPool(progressCh chan<- any, maxDownloads int) *WorkerPool {
@@ -168,12 +172,23 @@ func (p *WorkerPool) Pause(downloadID string) bool {
 
 	// Set paused flag and cancel context
 	if ad.config.State != nil {
-		// Idempotency: If already pausing or paused, do nothing
-		if ad.config.State.IsPausing() || ad.config.State.IsPaused() {
+		// Idempotency: If already paused, do nothing.
+		if ad.config.State.IsPaused() {
+			return true
+		}
+		// If transition is already in progress, still ensure worker context is canceled.
+		if ad.config.State.IsPausing() {
+			if ad.cancel != nil {
+				ad.cancel()
+			}
 			return true
 		}
 		ad.config.State.SetPausing(true) // Mark as transitioning to pause
 		ad.config.State.Pause()
+	}
+	// Always cancel worker context as a safety net (single downloader does not set state cancel itself).
+	if ad.cancel != nil {
+		ad.cancel()
 	}
 
 	// Send pause message
@@ -211,31 +226,49 @@ func (p *WorkerPool) PauseAll() {
 // Cancel cancels and removes a download by ID
 func (p *WorkerPool) Cancel(downloadID string) {
 	p.mu.Lock()
-	ad, exists := p.downloads[downloadID]
-	if exists {
+	ad, activeExists := p.downloads[downloadID]
+	qCfg, queuedExists := p.queued[downloadID]
+	if activeExists {
 		delete(p.downloads, downloadID)
+	}
+	if queuedExists {
+		delete(p.queued, downloadID)
 	}
 	p.mu.Unlock()
 
-	if !exists || ad == nil {
+	if !activeExists && !queuedExists {
 		return
 	}
 
-	// Cancel the context to stop workers
-	if ad.cancel != nil {
-		ad.cancel()
-	}
+	removedFilename := ""
+	if activeExists && ad != nil {
+		removedFilename = ad.config.Filename
 
-	// Mark as done to stop polling
-	if ad.config.State != nil {
-		ad.config.State.Done.Store(true)
+		// Cancel the context to stop workers
+		if ad.cancel != nil {
+			ad.cancel()
+		}
+
+		// Best effort: wait for worker to exit so delete cleanup doesn't race with
+		// downloader startup that can recreate the .surge file after removal.
+		deadline := time.Now().Add(cancelStopWaitTimeout)
+		for ad.running.Load() && time.Now().Before(deadline) {
+			time.Sleep(cancelStopPollInterval)
+		}
+
+		// Mark as done to stop polling
+		if ad.config.State != nil {
+			ad.config.State.Done.Store(true)
+		}
+	} else if queuedExists {
+		removedFilename = qCfg.Filename
 	}
 
 	// Send removal message
 	if p.progressCh != nil {
 		p.progressCh <- events.DownloadRemovedMsg{
 			DownloadID: downloadID,
-			Filename:   ad.config.Filename,
+			Filename:   removedFilename,
 		}
 	}
 }
@@ -325,6 +358,14 @@ func (p *WorkerPool) UpdateURL(downloadID string, newURL string) error {
 
 func (p *WorkerPool) worker() {
 	for cfg := range p.taskChan {
+		p.mu.RLock()
+		_, stillQueued := p.queued[cfg.ID]
+		p.mu.RUnlock()
+		if !stillQueued {
+			// Canceled while waiting in queue.
+			continue
+		}
+
 		p.wg.Add(1)
 		// Create cancellable context
 		ctx, cancel := context.WithCancel(context.Background())
@@ -333,6 +374,9 @@ func (p *WorkerPool) worker() {
 		ad := &activeDownload{
 			config: cfg,
 			cancel: cancel,
+		}
+		if ad.config.State != nil {
+			ad.config.State.SetCancelFunc(cancel)
 		}
 		ad.running.Store(true)
 		p.mu.Lock()
