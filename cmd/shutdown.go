@@ -14,13 +14,18 @@ var (
 )
 
 func defaultGlobalShutdown() error {
+	cancelGlobalEnqueue()
+
+	var err error
 	if GlobalService != nil {
-		return GlobalService.Shutdown()
-	}
-	if GlobalPool != nil {
+		err = GlobalService.Shutdown()
+	} else if GlobalPool != nil {
 		GlobalPool.GracefulShutdown()
 	}
-	return nil
+	if cleanup := takeLifecycleCleanup(); cleanup != nil {
+		cleanup()
+	}
+	return err
 }
 
 func executeGlobalShutdown(reason string) error {
@@ -37,6 +42,8 @@ func executeGlobalShutdown(reason string) error {
 func resetGlobalShutdownCoordinatorForTest(fn func() error) {
 	globalShutdownOnce = sync.Once{}
 	globalShutdownErr = nil
+	resetGlobalEnqueueContext()
+	_ = takeLifecycleCleanup()
 	if fn != nil {
 		globalShutdownFn = fn
 		return

@@ -1,17 +1,17 @@
 package tui
 
 import (
-	"bufio"
+	"context"
 	"fmt"
-	"net/url"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/surge-downloader/surge/internal/processing"
 
 	"github.com/surge-downloader/surge/internal/clipboard"
 	"github.com/surge-downloader/surge/internal/config"
@@ -37,6 +37,19 @@ type UpdateCheckResultMsg struct {
 
 type shutdownCompleteMsg struct {
 	err error
+}
+
+type enqueueSuccessMsg struct {
+	tempID   string
+	id       string
+	url      string
+	path     string
+	filename string
+}
+
+type enqueueErrorMsg struct {
+	tempID string
+	err    error
 }
 
 // checkForUpdateCmd performs an async update check
@@ -74,63 +87,6 @@ func openWithSystem(path string) error {
 		}()
 	}
 	return err
-}
-
-// readURLsFromFile reads URLs from a file, accepting one-per-line or whitespace-separated URLs.
-// It skips comments and duplicate URLs.
-func readURLsFromFile(filepath string) ([]string, error) {
-	file, err := os.Open(filepath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %w", err)
-	}
-	defer func() {
-		if err := file.Close(); err != nil {
-			utils.Debug("Error closing file: %v", err)
-		}
-	}()
-
-	var urls []string
-	seen := make(map[string]bool)
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 64*config.KB), config.MB)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		idx := -1
-		for i := 0; i < len(line); i++ {
-			if line[i] == '#' && i > 0 && (line[i-1] == ' ' || line[i-1] == '\t') {
-				idx = i
-				break
-			}
-		}
-		if idx > 0 {
-			line = strings.TrimSpace(line[:idx])
-		}
-		if line == "" {
-			continue
-		}
-
-		for _, token := range strings.Fields(line) {
-			// Normalize URL for duplicate detection
-			normalized := strings.TrimRight(token, "/")
-			if !seen[normalized] {
-				seen[normalized] = true
-				urls = append(urls, token)
-			}
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
-	}
-
-	if len(urls) == 0 {
-		return nil, fmt.Errorf("no URLs found in file")
-	}
-
-	return urls, nil
 }
 
 // addLogEntry adds a log entry to the log viewport
@@ -203,22 +159,23 @@ func (m *RootModel) resetFilepickerToDirMode() {
 }
 
 // checkForDuplicate checks if a compatible download already exists
-func (m RootModel) checkForDuplicate(url string) *DownloadModel {
-	if !m.Settings.General.WarnOnDuplicate {
-		return nil
-	}
-	normalizedInputURL := strings.TrimRight(url, "/")
-	for _, d := range m.downloads {
-		// Ignore completed downloads
-		if d.done {
-			continue
+func (m RootModel) checkForDuplicate(url string) *processing.DuplicateResult {
+	activeDownloads := func() map[string]*types.DownloadConfig {
+		active := make(map[string]*types.DownloadConfig)
+		for _, d := range m.downloads {
+			if !d.done {
+				state := &types.ProgressState{}
+				// Create dummy config to pass into processing duplicate check
+				active[d.ID] = &types.DownloadConfig{
+					URL:      d.URL,
+					Filename: d.Filename,
+					State:    state,
+				}
+			}
 		}
-		normalizedExistingURL := strings.TrimRight(d.URL, "/")
-		if normalizedExistingURL == normalizedInputURL {
-			return d
-		}
+		return active
 	}
-	return nil
+	return processing.CheckForDuplicate(url, m.Settings, activeDownloads)
 }
 
 // startDownload initiates a new download
@@ -232,101 +189,123 @@ func (m RootModel) startDownload(url string, mirrors []string, headers map[strin
 	path = utils.EnsureAbsPath(path)
 
 	candidateFilename := strings.TrimSpace(filename)
-	categoryFilename := candidateFilename
-	if categoryFilename == "" {
-		categoryFilename = inferFilenameFromURL(url)
-	}
-
-	// Auto-route to category folder when enabled
-	if m.Settings.General.CategoryEnabled && categoryFilename != "" && isDefaultPath {
-		cat, err := config.GetCategoryForFile(categoryFilename, m.Settings.General.Categories)
-		if err != nil {
-			m.addLogEntry(LogStyleError.Render(fmt.Sprintf("✖ Category match error for %s: %v", categoryFilename, err)))
-			return m, nil
-		}
-		if cat != nil {
-			if catPath := config.ResolveCategoryPath(cat, m.Settings.General.DefaultDownloadDir); catPath != "" {
-				path = utils.EnsureAbsPath(catPath)
-				if err := os.MkdirAll(path, 0o755); err != nil {
-					m.addLogEntry(LogStyleError.Render(fmt.Sprintf("✖ Failed to create category path %s: %v", path, err)))
-					return m, nil
-				}
-			}
-		}
-	}
-
-	// Generate unique filename after the final destination path is known.
-	// For Local Service, we can generate it here. For Remote, the server might do it,
-	// but sending a unique filename is safer.
-	finalFilename := m.generateUniqueFilename(path, candidateFilename)
-	if finalFilename == "" {
-		finalFilename = m.generateUniqueFilename(path, categoryFilename)
-	}
-
-	// Call Service Add
-	// Note: We don't construct DownloadConfig/DownloadModel manually here for the queue
-	// We rely on the event stream to update the UI, OR we add it optimistically.
-	// Optimistic addition gives better UX.
-
-	var (
-		newID string
-		err   error
-	)
 	requestID := strings.TrimSpace(id)
-	if requestID != "" {
-		type idAwareAdder interface {
-			AddWithID(url string, path string, filename string, mirrors []string, headers map[string]string, id string) (string, error)
-		}
-		if svcWithID, ok := m.Service.(idAwareAdder); ok {
-			newID, err = svcWithID.AddWithID(url, path, finalFilename, mirrors, headers, requestID)
-		} else {
-			newID, err = m.Service.Add(url, path, finalFilename, mirrors, headers)
+
+	resolvedPath := path
+	resolvedFilename := candidateFilename
+	optimisticFilename := candidateFilename
+	if p, f, err := processing.ResolveDestination(url, candidateFilename, path, isDefaultPath, m.Settings, nil, nil); err == nil {
+		resolvedPath = p
+		resolvedFilename = f
+		if candidateFilename != "" {
+			// Only mirror the resolved filename into the optimistic row when the
+			// user already chose it; probe-derived names can legitimately change.
+			optimisticFilename = f
 		}
 	} else {
-		newID, err = m.Service.Add(url, path, finalFilename, mirrors, headers)
-	}
-	if err != nil {
-		m.addLogEntry(LogStyleError.Render("✖ Failed to add download: " + err.Error()))
-		return m, nil
+		utils.Debug("Optimistic destination resolve failed for %s: %v", url, err)
 	}
 
-	// Create optimistic model
-	newDownload := NewDownloadModel(newID, url, "Queued", 0)
-	newDownload.Destination = filepath.Join(path, finalFilename)
+	// Call Orchestrator Enqueue
+	req := &processing.DownloadRequest{
+		URL:                url,
+		Filename:           candidateFilename,
+		Path:               path,
+		Mirrors:            mirrors,
+		Headers:            headers,
+		IsExplicitCategory: !isDefaultPath,
+		SkipApproval:       true,
+	}
+
+	optimisticID := requestID
+	if optimisticID == "" {
+		optimisticID = fmt.Sprintf("pending-%d", time.Now().UnixNano())
+	}
+	displayName := optimisticFilename
+	if displayName == "" {
+		displayName = "Queued"
+	}
+
+	newDownload := NewDownloadModel(optimisticID, url, displayName, 0)
+	if resolvedFilename != "" {
+		newDownload.Destination = filepath.Join(resolvedPath, resolvedFilename)
+	} else {
+		newDownload.Destination = resolvedPath
+	}
 	m.downloads = append(m.downloads, newDownload)
-
-	m.SelectedDownloadID = newID
+	m.SelectedDownloadID = optimisticID
 	m.activeTab = TabQueued
 	m.UpdateListItems()
 
-	utils.Debug("Added to Queue (via Service): %s -> %s", url, finalFilename)
+	// Legacy path for tests or startup wiring where processing is not injected yet.
+	if m.Orchestrator == nil {
+		var (
+			newID string
+			err   error
+		)
+		if requestID != "" {
+			newID, err = m.Service.AddWithID(
+				url,
+				resolvedPath,
+				resolvedFilename,
+				mirrors,
+				headers,
+				requestID,
+				0,
+				false,
+			)
+		} else {
+			newID, err = m.Service.Add(
+				url,
+				resolvedPath,
+				resolvedFilename,
+				mirrors,
+				headers,
+				!isDefaultPath,
+				0,
+				false,
+			)
+		}
+		if err != nil {
+			m.removeDownloadByID(optimisticID)
+			m.UpdateListItems()
+			m.addLogEntry(LogStyleError.Render("✖ Failed to add download: " + err.Error()))
+			return m, nil
+		}
 
-	return m, nil
-}
-
-func inferFilenameFromURL(rawURL string) string {
-	parsed, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return ""
+		if d := m.FindDownloadByID(optimisticID); d != nil {
+			d.ID = newID
+		}
+		if m.SelectedDownloadID == optimisticID {
+			m.SelectedDownloadID = newID
+		}
+		m.UpdateListItems()
+		return m, nil
 	}
 
-	query := parsed.Query()
-	if name := strings.TrimSpace(query.Get("filename")); name != "" {
-		if base := strings.TrimSpace(path.Base(name)); base != "" && base != "." && base != ".." && base != "/" {
-			return base
+	cmd := func() tea.Msg {
+		ctx := m.downloadEnqueueContext()
+		var newID string
+		var err error
+		if requestID != "" {
+			newID, err = m.Orchestrator.EnqueueWithID(ctx, req, requestID)
+		} else {
+			newID, err = m.Orchestrator.Enqueue(ctx, req)
+		}
+		if err != nil {
+			return enqueueErrorMsg{tempID: optimisticID, err: err}
+		}
+		return enqueueSuccessMsg{
+			tempID:   optimisticID,
+			id:       newID,
+			url:      url,
+			path:     resolvedPath,
+			filename: optimisticFilename,
 		}
 	}
-	if name := strings.TrimSpace(query.Get("file")); name != "" {
-		if base := strings.TrimSpace(path.Base(name)); base != "" && base != "." && base != ".." && base != "/" {
-			return base
-		}
-	}
 
-	base := strings.TrimSpace(path.Base(parsed.Path))
-	if base == "" || base == "." || base == ".." || base == "/" {
-		return ""
-	}
-	return base
+	utils.Debug("Queued enqueue command (via Orchestrator): %s -> %s", url, optimisticFilename)
+	return m, cmd
 }
 
 func (m RootModel) defaultDownloadPath() string {
@@ -336,6 +315,13 @@ func (m RootModel) defaultDownloadPath() string {
 		}
 	}
 	return "."
+}
+
+func (m RootModel) downloadEnqueueContext() context.Context {
+	if m.enqueueCtx != nil {
+		return m.enqueueCtx
+	}
+	return context.Background()
 }
 
 func (m RootModel) isDefaultDownloadPath(path string) bool {
@@ -377,6 +363,59 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			d.pausing = false
 			d.resuming = true
 		}
+		return m, nil
+
+	case enqueueSuccessMsg:
+		if msg.tempID != "" && msg.tempID != msg.id {
+			temp := m.FindDownloadByID(msg.tempID)
+			real := m.FindDownloadByID(msg.id)
+			if temp != nil && real != nil && temp != real {
+				if real.URL == "" {
+					real.URL = temp.URL
+				}
+				if real.Filename == "" {
+					real.Filename = msg.filename
+					if real.Filename == "" {
+						real.Filename = temp.Filename
+					}
+					real.FilenameLower = strings.ToLower(real.Filename)
+				}
+				if real.Destination == "" {
+					real.Destination = temp.Destination
+				}
+				_ = m.removeDownloadByID(msg.tempID)
+			} else if temp != nil {
+				temp.ID = msg.id
+			}
+			if m.SelectedDownloadID == msg.tempID {
+				m.SelectedDownloadID = msg.id
+			}
+		}
+		m.UpdateListItems()
+		return m, nil
+
+	case enqueueErrorMsg:
+		if msg.tempID != "" {
+			if d := m.FindDownloadByID(msg.tempID); d != nil {
+				d.err = msg.err
+				d.done = true
+				d.paused = false
+				d.pausing = false
+				d.resuming = false
+				d.Speed = 0
+				d.Connections = 0
+				if d.FilenameLower == "" {
+					d.FilenameLower = strings.ToLower(d.Filename)
+				}
+			} else {
+				failed := NewDownloadModel(msg.tempID, "", "", 0)
+				failed.err = msg.err
+				failed.done = true
+				m.downloads = append(m.downloads, failed)
+			}
+			m.UpdateListItems()
+		}
+		m.addLogEntry(LogStyleError.Render("✖ Failed to enqueue download: " + msg.err.Error()))
 		return m, nil
 
 	case events.DownloadRequestMsg:
@@ -624,7 +663,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Check if a file was selected
 			if didSelect, path := m.filepicker.DidSelectFile(msg); didSelect {
 				// Read URLs from file
-				urls, err := readURLsFromFile(path)
+				urls, err := utils.ReadURLsFromFile(path)
 				if err != nil {
 					m.addLogEntry(LogStyleError.Render("✖ Failed to read batch file: " + err.Error()))
 					m.resetFilepickerToDirMode()
@@ -710,6 +749,9 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// Quit
 			if key.Matches(msg, m.keys.Dashboard.Quit, m.keys.Dashboard.ForceQuit) {
+				if m.cancelEnqueue != nil {
+					m.cancelEnqueue()
+				}
 				m.shuttingDown = true
 				return m, shutdownCmd(m.Service)
 			}
@@ -1251,7 +1293,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Check if a file was selected
 			if didSelect, path := m.filepicker.DidSelectFile(msg); didSelect {
 				// Read URLs from file
-				urls, err := readURLsFromFile(path)
+				urls, err := utils.ReadURLsFromFile(path)
 				if err != nil {
 					m.addLogEntry(LogStyleError.Render("✖ Failed to read batch file: " + err.Error()))
 					// Reset filepicker and return
@@ -1283,13 +1325,18 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				added := 0
 				skipped := 0
+				var batchCmds []tea.Cmd
 				for _, url := range m.pendingBatchURLs {
 					// Skip duplicate URLs
 					if m.checkForDuplicate(url) != nil {
 						skipped++
 						continue
 					}
-					m, _ = m.startDownload(url, nil, nil, path, true, "", "")
+					var cmd tea.Cmd
+					m, cmd = m.startDownload(url, nil, nil, path, true, "", "")
+					if cmd != nil {
+						batchCmds = append(batchCmds, cmd)
+					}
 					added++
 				}
 
@@ -1301,7 +1348,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pendingBatchURLs = nil
 				m.batchFilePath = ""
 				m.state = DashboardState
-				return m, nil
+				return m, tea.Batch(batchCmds...)
 			}
 			if key.Matches(msg, m.keys.BatchConfirm.Cancel) {
 				m.pendingBatchURLs = nil
@@ -1345,7 +1392,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Not editing - handle navigation
 			if key.Matches(msg, m.keys.Settings.Close) {
 				// Save settings and exit
-				_ = config.SaveSettings(m.Settings)
+				_ = m.persistSettings()
 				m.state = DashboardState
 				return m, nil
 			}
@@ -1486,7 +1533,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if key.Matches(msg, m.keys.Update.NeverRemind) {
 				// Persist the setting and dismiss
 				m.Settings.General.SkipUpdateCheck = true
-				_ = config.SaveSettings(m.Settings)
+				_ = m.persistSettings()
 				m.state = DashboardState
 				m.UpdateInfo = nil
 				return m, nil
@@ -1619,7 +1666,7 @@ func (m RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Not editing - handle navigation
 			if key.Matches(msg, m.keys.CategoryMgr.Close) {
-				_ = config.SaveSettings(m.Settings)
+				_ = m.persistSettings()
 				m.state = DashboardState
 				return m, nil
 			}
@@ -1730,64 +1777,4 @@ func (m *RootModel) updateListTitle() {
 	case TabDone:
 		m.list.Title = "✅ Completed"
 	}
-}
-
-// generateUniqueFilename creates a unique filename by appending (1), (2), etc.
-// if the filename already exists in the destination folder OR in the current downloads list
-func (m *RootModel) generateUniqueFilename(dir, filename string) string {
-	if filename == "" {
-		return filename // Let the downloader auto-detect
-	}
-
-	// Check if any download already has this filename
-	existsInDownloads := func(name string) bool {
-		for _, d := range m.downloads {
-			// Don't check against completed downloads in the list,
-			// as we rely on filesystem check for those.
-			// But do check active/queued ones to avoid collision before file is created.
-			if !d.done {
-				// Check by Filename (set via DownloadStartedMsg)
-				if d.Filename == name {
-					return true
-				}
-				// Also check by Destination path basename (set earlier, more reliable)
-				if d.Destination != "" && filepath.Base(d.Destination) == name {
-					return true
-				}
-			}
-		}
-		return false
-	}
-
-	// Check if file exists on disk (including incomplete .surge files)
-	existsOnDisk := func(name string) bool {
-		path := filepath.Join(dir, name)
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			return true
-		}
-		// Also check for incomplete download file (.surge extension)
-		if _, err := os.Stat(path + types.IncompleteSuffix); !os.IsNotExist(err) {
-			return true
-		}
-		return false
-	}
-
-	if !existsInDownloads(filename) && !existsOnDisk(filename) {
-		return filename
-	}
-
-	// Split filename into base and extension
-	ext := filepath.Ext(filename)
-	base := strings.TrimSuffix(filename, ext)
-
-	// Try (1), (2), etc. until we find a unique one
-	for i := 1; i <= 100; i++ {
-		candidate := fmt.Sprintf("%s(%d)%s", base, i, ext)
-		if !existsInDownloads(candidate) && !existsOnDisk(candidate) {
-			return candidate
-		}
-	}
-
-	// Fallback: just return original (shouldn't happen)
-	return filename
 }

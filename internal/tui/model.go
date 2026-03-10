@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/surge-downloader/surge/internal/config"
 	"github.com/surge-downloader/surge/internal/core"
 	"github.com/surge-downloader/surge/internal/engine/types"
+	"github.com/surge-downloader/surge/internal/processing"
 	"github.com/surge-downloader/surge/internal/tui/colors"
 	"github.com/surge-downloader/surge/internal/version"
 )
@@ -83,8 +85,10 @@ type RootModel struct {
 	activeTab    int // 0=Queued, 1=Active, 2=Done
 	inputs       []textinput.Model
 	focusedInput int
-	// Service Interface (replaces Pool)
-	Service core.DownloadService
+	// Service Interface
+	// Core
+	Service      core.DownloadService
+	Orchestrator *processing.LifecycleManager
 
 	// File picker for directory selection
 	filepicker filepicker.Model
@@ -169,7 +173,9 @@ type RootModel struct {
 
 	logoCache string // Cached logo with gradient applied
 
-	shuttingDown bool
+	enqueueCtx    context.Context
+	cancelEnqueue context.CancelFunc
+	shuttingDown  bool
 }
 
 // NewDownloadModel creates a new download model
@@ -188,7 +194,7 @@ func NewDownloadModel(id string, url string, filename string, total int64) *Down
 	}
 }
 
-func InitialRootModel(serverPort int, currentVersion string, service core.DownloadService, noResume bool) RootModel {
+func InitialRootModel(serverPort int, currentVersion string, service core.DownloadService, orchestrator *processing.LifecycleManager, noResume bool) RootModel {
 	// Initialize inputs
 	urlInput := textinput.New()
 	urlInput.Placeholder = "https://example.com/file.zip"
@@ -261,6 +267,8 @@ func InitialRootModel(serverPort int, currentVersion string, service core.Downlo
 				case "completed":
 					dm.done = true
 					dm.progress.SetPercent(1.0)
+				case "error":
+					dm.done = true
 				case "pausing":
 					dm.pausing = true
 				case "paused":
@@ -339,6 +347,8 @@ func InitialRootModel(serverPort int, currentVersion string, service core.Downlo
 	catPathInput.Width = 50
 	catPathInput.Prompt = ""
 
+	enqueueCtx, cancelEnqueue := context.WithCancel(context.Background())
+
 	m := RootModel{
 		downloads:             downloads,
 		inputs:                []textinput.Model{urlInput, mirrorsInput, pathInput, filenameInput},
@@ -347,11 +357,12 @@ func InitialRootModel(serverPort int, currentVersion string, service core.Downlo
 		help:                  helpModel,
 		list:                  downloadList,
 		Service:               service,
+		Orchestrator:          orchestrator,
 		PWD:                   pwd,
+		Settings:              settings,
 		SpeedHistory:          make([]float64, GraphHistoryPoints), // 60 points of history (30s at 0.5s interval)
 		logViewport:           viewport.New(40, 5),                 // Default size, will be resized
 		logEntries:            make([]string, 0),
-		Settings:              settings,
 		SettingsInput:         settingsInput,
 		searchInput:           searchInput,
 		urlUpdateInput:        urlUpdateInput,
@@ -360,6 +371,8 @@ func InitialRootModel(serverPort int, currentVersion string, service core.Downlo
 		ServerPort:            serverPort,
 		CurrentVersion:        currentVersion,
 		InitialDarkBackground: lipgloss.HasDarkBackground(),
+		enqueueCtx:            enqueueCtx,
+		cancelEnqueue:         cancelEnqueue,
 	}
 
 	// Apply configured theme
@@ -372,6 +385,20 @@ func InitialRootModel(serverPort int, currentVersion string, service core.Downlo
 		// ThemeAdaptive: do nothing, already set by system detection
 	}
 
+	return m
+}
+
+// WithEnqueueContext lets callers bind model-initiated probes to a process-level
+// shutdown context instead of the model's default standalone context.
+func (m RootModel) WithEnqueueContext(ctx context.Context, cancel context.CancelFunc) RootModel {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if cancel == nil {
+		cancel = func() {}
+	}
+	m.enqueueCtx = ctx
+	m.cancelEnqueue = cancel
 	return m
 }
 
@@ -491,7 +518,7 @@ func (m RootModel) matchesCategoryFilter(d *DownloadModel) bool {
 		}
 	}
 	if filename == "" || filename == "Queued" {
-		filename = inferFilenameFromURL(d.URL)
+		filename = processing.InferFilenameFromURL(d.URL)
 	}
 
 	cat, err := config.GetCategoryForFile(filename, m.Settings.General.Categories)

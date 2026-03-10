@@ -35,6 +35,7 @@ type DownloadCompleteMsg struct {
 type DownloadErrorMsg struct {
 	DownloadID string
 	Filename   string
+	DestPath   string
 	Err        error
 }
 
@@ -42,12 +43,14 @@ func (m DownloadErrorMsg) MarshalJSON() ([]byte, error) {
 	type encoded struct {
 		DownloadID string `json:"DownloadID"`
 		Filename   string `json:"Filename,omitempty"`
+		DestPath   string `json:"DestPath,omitempty"`
 		Err        string `json:"Err,omitempty"`
 	}
 
 	out := encoded{
 		DownloadID: m.DownloadID,
 		Filename:   m.Filename,
+		DestPath:   m.DestPath,
 	}
 	if m.Err != nil {
 		out.Err = m.Err.Error()
@@ -60,6 +63,7 @@ func (m *DownloadErrorMsg) UnmarshalJSON(data []byte) error {
 	var aux struct {
 		DownloadID string          `json:"DownloadID"`
 		Filename   string          `json:"Filename"`
+		DestPath   string          `json:"DestPath"`
 		Err        json.RawMessage `json:"Err"`
 	}
 	if err := json.Unmarshal(data, &aux); err != nil {
@@ -68,6 +72,7 @@ func (m *DownloadErrorMsg) UnmarshalJSON(data []byte) error {
 
 	m.DownloadID = aux.DownloadID
 	m.Filename = aux.Filename
+	m.DestPath = aux.DestPath
 	m.Err = nil
 
 	if len(aux.Err) == 0 {
@@ -105,6 +110,7 @@ type DownloadPausedMsg struct {
 	DownloadID string
 	Filename   string
 	Downloaded int64
+	State      *types.DownloadState `json:"-"`
 }
 
 type DownloadResumedMsg struct {
@@ -117,11 +123,14 @@ type DownloadQueuedMsg struct {
 	Filename   string
 	URL        string
 	DestPath   string
+	Mirrors    []string
 }
 
 type DownloadRemovedMsg struct {
 	DownloadID string
 	Filename   string
+	DestPath   string
+	Completed  bool
 }
 
 // SystemLogMsg carries informational system-level log messages for clients/UI.

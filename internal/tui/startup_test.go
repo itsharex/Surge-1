@@ -11,6 +11,7 @@ import (
 	"github.com/surge-downloader/surge/internal/download"
 	"github.com/surge-downloader/surge/internal/engine/state"
 	"github.com/surge-downloader/surge/internal/engine/types"
+	"github.com/surge-downloader/surge/internal/processing"
 )
 
 // TestTUI_Startup_HandlesResume verifies that TUI initialization handles resume logic correctly
@@ -36,7 +37,7 @@ func TestTUI_Startup_HandlesResume(t *testing.T) {
 	pool := download.NewWorkerPool(progressChan, 3)
 
 	// PASSING noResume=false (default)
-	m := InitialRootModel(1700, "test-version", core.NewLocalDownloadServiceWithInput(pool, progressChan), false)
+	m := InitialRootModel(1700, "test-version", core.NewLocalDownloadServiceWithInput(pool, progressChan), processing.NewLifecycleManager(nil, nil), false)
 
 	// 4. Verify Download is Active in Model
 	// InitialRootModel loads downloads and should set paused=false for "queued" items
@@ -98,7 +99,7 @@ func TestTUI_Startup_LoadsCompletedTiming(t *testing.T) {
 
 	progressChan := make(chan any, 10)
 	pool := download.NewWorkerPool(progressChan, 3)
-	m := InitialRootModel(1700, "test-version", core.NewLocalDownloadServiceWithInput(pool, progressChan), false)
+	m := InitialRootModel(1700, "test-version", core.NewLocalDownloadServiceWithInput(pool, progressChan), processing.NewLifecycleManager(nil, nil), false)
 
 	var found *DownloadModel
 	for _, d := range m.downloads {
@@ -118,6 +119,48 @@ func TestTUI_Startup_LoadsCompletedTiming(t *testing.T) {
 	}
 	if found.Speed != avgSpeed {
 		t.Errorf("Speed = %f, want %f", found.Speed, avgSpeed)
+	}
+}
+
+func TestTUI_Startup_LoadsErroredDownloadsIntoDoneTab(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "surge-tui-error-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	setupTestEnv(t, tmpDir)
+
+	testID := "tui-error-id"
+	testURL := "http://example.com/error.bin"
+	testDest := filepath.Join(tmpDir, "error.bin")
+	if err := state.AddToMasterList(types.DownloadEntry{
+		ID:       testID,
+		URL:      testURL,
+		URLHash:  state.URLHash(testURL),
+		DestPath: testDest,
+		Filename: filepath.Base(testDest),
+		Status:   "error",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	progressChan := make(chan any, 10)
+	pool := download.NewWorkerPool(progressChan, 3)
+	m := InitialRootModel(1700, "test-version", core.NewLocalDownloadServiceWithInput(pool, progressChan), processing.NewLifecycleManager(nil, nil), false)
+
+	var found *DownloadModel
+	for _, d := range m.downloads {
+		if d.ID == testID {
+			found = d
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("TUI Model failed to load errored download")
+	}
+	if !found.done {
+		t.Fatal("expected errored download to appear in done tab")
 	}
 }
 

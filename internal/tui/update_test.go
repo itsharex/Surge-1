@@ -1,8 +1,8 @@
 package tui
 
 import (
+	"context"
 	"errors"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,134 +15,10 @@ import (
 	"github.com/surge-downloader/surge/internal/download"
 	"github.com/surge-downloader/surge/internal/engine/events"
 	"github.com/surge-downloader/surge/internal/engine/types"
+	"github.com/surge-downloader/surge/internal/processing"
 )
 
 var errTest = errors.New("test error")
-
-func TestGenerateUniqueFilename(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "surge-tui-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	// Helper to create a dummy file
-	createFile := func(name string) {
-		path := filepath.Join(tmpDir, name)
-		if err := os.WriteFile(path, []byte("test"), 0o644); err != nil {
-			t.Fatalf("Failed to create file %s: %v", path, err)
-		}
-	}
-
-	tests := []struct {
-		name               string
-		existingFiles      []string
-		activeDownload     string // filename of an active (non-done) download in the model
-		activeDownloadDest string // destination path of an active download (tests Destination check)
-		inputFilename      string
-		want               string
-	}{
-		{
-			name:          "No conflict",
-			existingFiles: []string{},
-			inputFilename: "file.txt",
-			want:          "file.txt",
-		},
-		{
-			name:          "Conflict with existing file",
-			existingFiles: []string{"file.txt"},
-			inputFilename: "file.txt",
-			want:          "file(1).txt",
-		},
-		{
-			name:          "Conflict with .surge file (paused download)",
-			existingFiles: []string{"file.txt.surge"},
-			inputFilename: "file.txt",
-			want:          "file(1).txt",
-		},
-		{
-			name:          "Conflict with both final and .surge file",
-			existingFiles: []string{"file.txt", "file(1).txt.surge"},
-			inputFilename: "file.txt",
-			want:          "file(2).txt",
-		},
-		{
-			name:          "Multiple .surge conflicts",
-			existingFiles: []string{"1GB.bin.surge", "1GB(1).bin.surge"},
-			inputFilename: "1GB.bin",
-			want:          "1GB(2).bin",
-		},
-		{
-			name:           "Conflict with active download in list",
-			existingFiles:  []string{},
-			activeDownload: "file.txt",
-			inputFilename:  "file.txt",
-			want:           "file(1).txt",
-		},
-		{
-			name:           "Combined: file on disk and active download",
-			existingFiles:  []string{"file.txt"},
-			activeDownload: "file(1).txt",
-			inputFilename:  "file.txt",
-			want:           "file(2).txt",
-		},
-		{
-			name:           "Combined: .surge file and active download",
-			existingFiles:  []string{"file.txt.surge"},
-			activeDownload: "file(1).txt",
-			inputFilename:  "file.txt",
-			want:           "file(2).txt",
-		},
-		{
-			name:               "Conflict with download by Destination path",
-			existingFiles:      []string{},
-			activeDownloadDest: "/downloads/file.txt",
-			inputFilename:      "file.txt",
-			want:               "file(1).txt",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Create a minimal RootModel
-			m := &RootModel{
-				downloads: []*DownloadModel{},
-			}
-
-			// Add active download if specified
-			if tt.activeDownload != "" {
-				m.downloads = append(m.downloads, &DownloadModel{
-					Filename: tt.activeDownload,
-					done:     false,
-				})
-			}
-
-			// Add active download by destination path if specified
-			if tt.activeDownloadDest != "" {
-				m.downloads = append(m.downloads, &DownloadModel{
-					Destination: tt.activeDownloadDest,
-					done:        false,
-				})
-			}
-
-			// Setup existing files
-			for _, f := range tt.existingFiles {
-				createFile(f)
-			}
-			// Cleanup after test case
-			defer func() {
-				for _, f := range tt.existingFiles {
-					_ = os.Remove(filepath.Join(tmpDir, f))
-				}
-			}()
-
-			got := m.generateUniqueFilename(tmpDir, tt.inputFilename)
-			if got != tt.want {
-				t.Errorf("generateUniqueFilename() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
 
 func TestUpdate_ResumeResultSetsResuming(t *testing.T) {
 	m := RootModel{
@@ -212,6 +88,51 @@ func TestUpdate_DownloadStartedKeepsResuming(t *testing.T) {
 	}
 	if d.paused || d.pausing || !d.resuming {
 		t.Fatalf("Expected paused/pausing cleared and resuming preserved on DownloadStartedMsg, got paused=%v pausing=%v resuming=%v", d.paused, d.pausing, d.resuming)
+	}
+}
+
+func TestUpdate_EnqueueSuccessMergesOptimisticEntryAfterStart(t *testing.T) {
+	optimistic := NewDownloadModel("pending-1", "http://example.com/file", "file.bin", 0)
+	optimistic.Destination = "/tmp/file.bin"
+
+	m := RootModel{
+		downloads:          []*DownloadModel{optimistic},
+		SelectedDownloadID: "pending-1",
+		list:               NewDownloadList(80, 20),
+		logViewport:        viewport.New(40, 5),
+	}
+
+	updated, _ := m.Update(events.DownloadStartedMsg{
+		DownloadID: "real-1",
+		URL:        "http://example.com/file",
+		Filename:   "file.bin",
+		Total:      100,
+		DestPath:   "/tmp/file.bin",
+		State:      types.NewProgressState("real-1", 100),
+	})
+	m2 := updated.(RootModel)
+	if len(m2.downloads) != 2 {
+		t.Fatalf("expected optimistic and real entries before enqueue success, got %d", len(m2.downloads))
+	}
+
+	updated, _ = m2.Update(enqueueSuccessMsg{
+		tempID:   "pending-1",
+		id:       "real-1",
+		url:      "http://example.com/file",
+		path:     "/tmp",
+		filename: "file.bin",
+	})
+	m3 := updated.(RootModel)
+
+	if len(m3.downloads) != 1 {
+		t.Fatalf("expected optimistic duplicate to be removed, got %d entries", len(m3.downloads))
+	}
+	if m3.downloads[0].ID != "real-1" {
+		t.Fatalf("remaining download ID = %q, want real-1", m3.downloads[0].ID)
+	}
+	selected := m3.GetSelectedDownload()
+	if selected == nil || selected.ID != "real-1" {
+		t.Fatalf("selected download = %#v, want real-1", selected)
 	}
 }
 
@@ -412,14 +333,6 @@ func TestProcessProgressMsg_UpdatesElapsed(t *testing.T) {
 	}
 }
 
-func TestGenerateUniqueFilename_EmptyFilename(t *testing.T) {
-	m := &RootModel{}
-	got := m.generateUniqueFilename("/tmp", "")
-	if got != "" {
-		t.Errorf("generateUniqueFilename() with empty filename = %v, want empty string", got)
-	}
-}
-
 func TestGenerateUniqueFilename_IncompleteSuffixConstant(t *testing.T) {
 	// Verify the constant we're using is correct
 	if types.IncompleteSuffix != ".surge" {
@@ -503,25 +416,6 @@ func TestUpdate_DownloadRequestMsg(t *testing.T) {
 	}
 }
 
-func TestInferFilenameFromURL_RejectsDotAndDotDotQueryNames(t *testing.T) {
-	tests := []struct {
-		rawURL string
-		want   string
-	}{
-		{rawURL: "https://example.com/download?filename=.", want: "download"},
-		{rawURL: "https://example.com/download?filename=..", want: "download"},
-		{rawURL: "https://example.com/download?file=.", want: "download"},
-		{rawURL: "https://example.com/download?file=..", want: "download"},
-		{rawURL: "https://example.com/?filename=..", want: ""},
-	}
-
-	for _, tt := range tests {
-		if got := inferFilenameFromURL(tt.rawURL); got != tt.want {
-			t.Fatalf("inferFilenameFromURL(%q) = %q, want %q", tt.rawURL, got, tt.want)
-		}
-	}
-}
-
 func TestStartDownload_UsesProvidedIDWhenServiceSupportsIt(t *testing.T) {
 	ch := make(chan any, 16)
 	pool := download.NewWorkerPool(ch, 1)
@@ -546,6 +440,216 @@ func TestStartDownload_UsesProvidedIDWhenServiceSupportsIt(t *testing.T) {
 	}
 	if got := updated.downloads[0].ID; got != requestID {
 		t.Fatalf("queued download ID = %q, want %q", got, requestID)
+	}
+}
+
+func TestStartDownload_UsesModelEnqueueContext(t *testing.T) {
+	svc := core.NewLocalDownloadServiceWithInput(nil, nil)
+	t.Cleanup(func() {
+		_ = svc.Shutdown()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	orchestrator := processing.NewLifecycleManager(
+		func(string, string, string, []string, map[string]string, bool, int64, bool) (string, error) {
+			t.Fatal("enqueue dispatch should not run after context cancellation")
+			return "", nil
+		},
+		nil,
+	)
+
+	m := RootModel{
+		Settings:      config.DefaultSettings(),
+		Service:       svc,
+		Orchestrator:  orchestrator,
+		enqueueCtx:    ctx,
+		cancelEnqueue: func() {},
+		list:          NewDownloadList(80, 20),
+		logViewport:   viewport.New(40, 5),
+	}
+
+	updated, cmd := m.startDownload("https://example.com/file.bin", nil, nil, t.TempDir(), false, "file.bin", "")
+	if cmd == nil {
+		t.Fatal("expected enqueue command")
+	}
+	if len(updated.downloads) != 1 {
+		t.Fatalf("expected optimistic queued download, got %d", len(updated.downloads))
+	}
+
+	msg := cmd()
+	errMsg, ok := msg.(enqueueErrorMsg)
+	if !ok {
+		t.Fatalf("msg = %T, want enqueueErrorMsg", msg)
+	}
+	if !errors.Is(errMsg.err, context.Canceled) {
+		t.Fatalf("err = %v, want context canceled", errMsg.err)
+	}
+}
+
+func TestStartDownload_DoesNotGuessProbeDerivedFilenameOptimistically(t *testing.T) {
+	svc := core.NewLocalDownloadServiceWithInput(nil, nil)
+	t.Cleanup(func() {
+		_ = svc.Shutdown()
+	})
+
+	orchestrator := processing.NewLifecycleManager(
+		func(string, string, string, []string, map[string]string, bool, int64, bool) (string, error) {
+			return "real-id", nil
+		},
+		nil,
+	)
+
+	targetDir := t.TempDir()
+	m := RootModel{
+		Settings:     config.DefaultSettings(),
+		Service:      svc,
+		Orchestrator: orchestrator,
+		list:         NewDownloadList(80, 20),
+		logViewport:  viewport.New(40, 5),
+	}
+
+	updated, _ := m.startDownload("https://example.com/100MB.bin", nil, nil, targetDir, true, "", "")
+
+	if len(updated.downloads) != 1 {
+		t.Fatalf("expected 1 optimistic queued download, got %d", len(updated.downloads))
+	}
+	d := updated.downloads[0]
+	if d.Filename != "Queued" {
+		t.Fatalf("optimistic filename = %q, want generic queued placeholder", d.Filename)
+	}
+	if d.Destination != filepath.Join(targetDir, "100MB.bin") {
+		t.Fatalf("optimistic destination = %q, want %q", d.Destination, filepath.Join(targetDir, "100MB.bin"))
+	}
+}
+
+func TestStartDownload_UsesGenericQueuedNameForExplicitFilenameUntilLifecycleConfirms(t *testing.T) {
+	svc := core.NewLocalDownloadServiceWithInput(nil, nil)
+	t.Cleanup(func() {
+		_ = svc.Shutdown()
+	})
+
+	orchestrator := processing.NewLifecycleManager(
+		func(string, string, string, []string, map[string]string, bool, int64, bool) (string, error) {
+			return "real-id", nil
+		},
+		nil,
+	)
+
+	targetDir := t.TempDir()
+	m := RootModel{
+		Settings:     config.DefaultSettings(),
+		Service:      svc,
+		Orchestrator: orchestrator,
+		list:         NewDownloadList(80, 20),
+		logViewport:  viewport.New(40, 5),
+	}
+
+	updated, _ := m.startDownload("https://example.com/archive.zip", nil, nil, targetDir, false, "archive.zip", "")
+
+	if len(updated.downloads) != 1 {
+		t.Fatalf("expected 1 optimistic queued download, got %d", len(updated.downloads))
+	}
+	d := updated.downloads[0]
+	if d.Filename != "archive.zip" {
+		t.Fatalf("optimistic filename = %q, want \"archive.zip\"", d.Filename)
+	}
+	if d.Destination != filepath.Join(targetDir, "archive.zip") {
+		t.Fatalf("optimistic destination = %q, want %q", d.Destination, filepath.Join(targetDir, "archive.zip"))
+	}
+}
+
+func TestUpdate_EnqueueErrorKeepsFailedDownloadVisibleInDoneTab(t *testing.T) {
+	optimistic := NewDownloadModel("pending-1", "http://example.com/file", "file.bin", 0)
+	optimistic.Destination = "/tmp/file.bin"
+
+	m := RootModel{
+		activeTab:      TabDone,
+		downloads:      []*DownloadModel{optimistic},
+		list:           NewDownloadList(80, 20),
+		logViewport:    viewport.New(40, 5),
+		Settings:       config.DefaultSettings(),
+		searchQuery:    "",
+		categoryFilter: "",
+	}
+
+	updated, _ := m.Update(enqueueErrorMsg{tempID: "pending-1", err: errTest})
+	m2 := updated.(RootModel)
+
+	if len(m2.downloads) != 1 {
+		t.Fatalf("expected failed optimistic entry to remain, got %d entries", len(m2.downloads))
+	}
+	d := m2.downloads[0]
+	if d.ID != "pending-1" {
+		t.Fatalf("download ID = %q, want pending-1", d.ID)
+	}
+	if !d.done {
+		t.Fatal("expected enqueue failure to mark the entry done")
+	}
+	if !errors.Is(d.err, errTest) {
+		t.Fatalf("download err = %v, want %v", d.err, errTest)
+	}
+	if got := len(m2.getFilteredDownloads()); got != 1 {
+		t.Fatalf("done tab entries = %d, want 1 failed enqueue entry", got)
+	}
+}
+
+func TestUpdate_QuitCancelsEnqueueContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	m := RootModel{
+		state:         DashboardState,
+		keys:          Keys,
+		enqueueCtx:    ctx,
+		cancelEnqueue: cancel,
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m2 := updated.(RootModel)
+
+	if !m2.shuttingDown {
+		t.Fatal("expected model to enter shutdown state")
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("expected quit to cancel enqueue context")
+	}
+}
+
+func TestWithEnqueueContext_OverridesStartDownloadContext(t *testing.T) {
+	svc := core.NewLocalDownloadServiceWithInput(nil, nil)
+	t.Cleanup(func() {
+		_ = svc.Shutdown()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	orchestrator := processing.NewLifecycleManager(
+		func(string, string, string, []string, map[string]string, bool, int64, bool) (string, error) {
+			t.Fatal("enqueue dispatch should not run after shared context cancellation")
+			return "", nil
+		},
+		nil,
+	)
+
+	m := InitialRootModel(1700, "test-version", svc, orchestrator, false)
+	m = m.WithEnqueueContext(ctx, func() {})
+
+	_, cmd := m.startDownload("https://example.com/file.bin", nil, nil, t.TempDir(), false, "file.bin", "")
+	if cmd == nil {
+		t.Fatal("expected enqueue command")
+	}
+
+	msg := cmd()
+	errMsg, ok := msg.(enqueueErrorMsg)
+	if !ok {
+		t.Fatalf("msg = %T, want enqueueErrorMsg", msg)
+	}
+	if !errors.Is(errMsg.err, context.Canceled) {
+		t.Fatalf("err = %v, want context canceled", errMsg.err)
 	}
 }
 

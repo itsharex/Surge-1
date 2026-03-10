@@ -51,6 +51,7 @@ type LocalDownloadService struct {
 	listeners  []chan interface{}
 	listenerMu sync.Mutex
 
+	broadcastWG  sync.WaitGroup
 	reportTicker *time.Ticker
 	reportWG     sync.WaitGroup
 
@@ -99,7 +100,11 @@ func NewLocalDownloadServiceWithInput(pool *download.WorkerPool, inputCh chan in
 	s.cancel = cancel
 
 	// Start broadcaster
-	go s.broadcastLoop()
+	s.broadcastWG.Add(1)
+	go func() {
+		defer s.broadcastWG.Done()
+		s.broadcastLoop()
+	}()
 
 	// Start progress reporter
 	if pool != nil {
@@ -122,6 +127,8 @@ func (s *LocalDownloadService) broadcastLoop() {
 			isProgress := false
 			switch msg.(type) {
 			case events.ProgressMsg:
+				isProgress = true
+			case events.BatchProgressMsg:
 				isProgress = true
 			}
 
@@ -287,14 +294,11 @@ func (s *LocalDownloadService) StreamEvents(ctx context.Context) (<-chan interfa
 		})
 	}
 
-	// Cleanup listener on context cancellation or service shutdown
+	// Callers own listener lifetime; service shutdown closes listeners after the
+	// broadcaster drains InputCh so lifecycle persistence can observe final events.
 	go func() {
-		select {
-		case <-ctx.Done():
-			cleanup()
-		case <-s.ctx.Done():
-			cleanup()
-		}
+		<-ctx.Done()
+		cleanup()
 	}()
 
 	return ch, cleanup, nil
@@ -331,6 +335,7 @@ func (s *LocalDownloadService) Shutdown() error {
 		if s.InputCh != nil {
 			close(s.InputCh)
 		}
+		s.broadcastWG.Wait()
 	})
 	return s.shutdownErr
 }
@@ -438,17 +443,18 @@ func (s *LocalDownloadService) List() ([]types.DownloadStatus, error) {
 	return statuses, nil
 }
 
-// Add queues a new download.
-func (s *LocalDownloadService) Add(url string, path string, filename string, mirrors []string, headers map[string]string) (string, error) {
-	return s.add(url, path, filename, mirrors, headers, "")
+// Add queues a new download on the local pool without TUI confirmation.
+func (s *LocalDownloadService) Add(url string, path string, filename string, mirrors []string, headers map[string]string, isExplicitCategory bool, totalSize int64, supportsRange bool) (string, error) {
+	return s.add(url, path, filename, mirrors, headers, "", isExplicitCategory, totalSize, supportsRange)
 }
 
 // AddWithID queues a new download using a caller-provided id when non-empty.
-func (s *LocalDownloadService) AddWithID(url string, path string, filename string, mirrors []string, headers map[string]string, id string) (string, error) {
-	return s.add(url, path, filename, mirrors, headers, id)
+func (s *LocalDownloadService) AddWithID(url string, path string, filename string, mirrors []string, headers map[string]string, id string, totalSize int64, supportsRange bool) (string, error) {
+	// Remote or RPC-driven calls use preset IDs and should bypass interactive category routing.
+	return s.add(url, path, filename, mirrors, headers, id, false, totalSize, supportsRange)
 }
 
-func (s *LocalDownloadService) add(url string, path string, filename string, mirrors []string, headers map[string]string, requestedID string) (string, error) {
+func (s *LocalDownloadService) add(url string, path string, filename string, mirrors []string, headers map[string]string, requestedID string, isExplicitCategory bool, totalSize int64, supportsRange bool) (string, error) {
 	if s.Pool == nil {
 		return "", fmt.Errorf("worker pool not initialized")
 	}
@@ -457,7 +463,6 @@ func (s *LocalDownloadService) add(url string, path string, filename string, mir
 	settings := s.settings
 	s.settingsMu.RUnlock()
 
-	// Prepare output path
 	outPath := path
 	if outPath == "" {
 		if settings.General.DefaultDownloadDir != "" {
@@ -481,20 +486,22 @@ func (s *LocalDownloadService) add(url string, path string, filename string, mir
 		return "", fmt.Errorf("download id already exists")
 	}
 
-	// Create configuration
 	state := types.NewProgressState(id, 0)
 	state.DestPath = filepath.Join(outPath, filename) // Best guess until download starts
 
 	cfg := types.DownloadConfig{
-		URL:        url,
-		Mirrors:    mirrors,
-		OutputPath: outPath,
-		ID:         id,
-		Filename:   filename, // If empty, will be auto-detected
-		ProgressCh: s.InputCh,
-		State:      state,
-		Runtime:    types.ConvertRuntimeConfig(settings.ToRuntimeConfig()),
-		Headers:    headers,
+		URL:                url,
+		Mirrors:            mirrors,
+		OutputPath:         outPath,
+		ID:                 id,
+		Filename:           filename, // If empty, will be auto-detected
+		ProgressCh:         s.InputCh,
+		State:              state,
+		Runtime:            types.ConvertRuntimeConfig(settings.ToRuntimeConfig()),
+		Headers:            headers,
+		IsExplicitCategory: isExplicitCategory,
+		TotalSize:          totalSize,
+		SupportsRange:      supportsRange,
 	}
 
 	s.Pool.Add(cfg)
@@ -539,12 +546,10 @@ func (s *LocalDownloadService) Resume(id string) error {
 		return fmt.Errorf("download is still pausing, try again in a moment")
 	}
 
-	// Try pool resume first
 	if s.Pool.Resume(id) {
 		return nil
 	}
 
-	// Cold Resume Logic
 	entry, err := state.GetDownload(id)
 	if err != nil || entry == nil {
 		return fmt.Errorf("download not found")
@@ -558,13 +563,11 @@ func (s *LocalDownloadService) Resume(id string) error {
 	settings := s.settings
 	s.settingsMu.RUnlock()
 
-	// Reconstruct configuration
 	outputPath := settings.General.DefaultDownloadDir
 	if outputPath == "" {
 		outputPath = "."
 	}
 
-	// Load saved state
 	savedState, stateErr := state.LoadState(entry.URL, entry.DestPath)
 
 	var mirrorURLs []string
@@ -597,17 +600,19 @@ func (s *LocalDownloadService) Resume(id string) error {
 	}
 
 	cfg := types.DownloadConfig{
-		URL:        entry.URL,
-		OutputPath: outputPath,
-		DestPath:   entry.DestPath,
-		ID:         id,
-		Filename:   entry.Filename,
-		IsResume:   true,
-		ProgressCh: s.InputCh,
-		State:      dmState,
-		SavedState: savedState, // Pass loaded state to avoid re-query
-		Runtime:    types.ConvertRuntimeConfig(settings.ToRuntimeConfig()),
-		Mirrors:    mirrorURLs,
+		URL:           entry.URL,
+		OutputPath:    outputPath,
+		DestPath:      entry.DestPath,
+		ID:            id,
+		Filename:      entry.Filename,
+		TotalSize:     entry.TotalSize,
+		SupportsRange: savedState != nil && len(savedState.Tasks) > 0,
+		IsResume:      true,
+		ProgressCh:    s.InputCh,
+		State:         dmState,
+		SavedState:    savedState, // Pass loaded state to avoid re-query
+		Runtime:       types.ConvertRuntimeConfig(settings.ToRuntimeConfig()),
+		Mirrors:       mirrorURLs,
 	}
 
 	s.Pool.Add(cfg)
@@ -631,7 +636,6 @@ func (s *LocalDownloadService) ResumeBatch(ids []string) []error {
 		return errs
 	}
 
-	// 1. Try pool resume first for all
 	toLoad := []string{}
 	idMap := make(map[string]int)
 
@@ -642,9 +646,8 @@ func (s *LocalDownloadService) ResumeBatch(ids []string) []error {
 		}
 
 		if s.Pool.Resume(id) {
-			errs[i] = nil // Success
+			errs[i] = nil
 		} else {
-			// Need cold resume
 			toLoad = append(toLoad, id)
 			idMap[id] = i
 		}
@@ -658,16 +661,13 @@ func (s *LocalDownloadService) ResumeBatch(ids []string) []error {
 	settings := s.settings
 	s.settingsMu.RUnlock()
 
-	// Default output path
 	outputPath := settings.General.DefaultDownloadDir
 	if outputPath == "" {
 		outputPath = "."
 	}
 
-	// 2. Load states in batch
 	states, err := state.LoadStates(toLoad)
 	if err != nil {
-		// If batch load fails, mark all remaining as failed
 		for _, id := range toLoad {
 			idx := idMap[id]
 			errs[idx] = fmt.Errorf("failed to load state: %w", err)
@@ -675,17 +675,14 @@ func (s *LocalDownloadService) ResumeBatch(ids []string) []error {
 		return errs
 	}
 
-	// 3. Process loaded states
 	for _, id := range toLoad {
 		idx := idMap[id]
 		savedState, ok := states[id]
 		if !ok {
-			// Not found or completed (since LoadStates filters out completed)
 			errs[idx] = fmt.Errorf("download not found or completed")
 			continue
 		}
 
-		// Create Config
 		var dmState *types.ProgressState
 		var mirrorURLs []string
 
@@ -707,17 +704,19 @@ func (s *LocalDownloadService) ResumeBatch(ids []string) []error {
 		dmState.SyncSessionStart()
 
 		cfg := types.DownloadConfig{
-			URL:        savedState.URL,
-			OutputPath: outputPath,
-			DestPath:   savedState.DestPath,
-			ID:         id,
-			Filename:   savedState.Filename,
-			IsResume:   true,
-			ProgressCh: s.InputCh,
-			State:      dmState,
-			SavedState: savedState, // Pass loaded state to avoid re-query
-			Runtime:    types.ConvertRuntimeConfig(settings.ToRuntimeConfig()),
-			Mirrors:    mirrorURLs,
+			URL:           savedState.URL,
+			OutputPath:    outputPath,
+			DestPath:      savedState.DestPath,
+			ID:            id,
+			Filename:      savedState.Filename,
+			TotalSize:     savedState.TotalSize,
+			SupportsRange: len(savedState.Tasks) > 0,
+			IsResume:      true,
+			ProgressCh:    s.InputCh,
+			State:         dmState,
+			SavedState:    savedState, // Pass loaded state to avoid re-query
+			Runtime:       types.ConvertRuntimeConfig(settings.ToRuntimeConfig()),
+			Mirrors:       mirrorURLs,
 		}
 
 		s.Pool.Add(cfg)
@@ -757,20 +756,15 @@ func (s *LocalDownloadService) Delete(id string) error {
 
 	s.Pool.Cancel(id)
 
-	// Cleanup persisted state and partials if available
+	// Cleanup persisted state if available
 	if entry, err := state.GetDownload(id); err == nil && entry != nil {
 		removedFilename = entry.Filename
-		_ = state.DeleteState(entry.ID)
-		if entry.DestPath != "" && entry.Status != "completed" {
-			_ = state.RemoveIncompleteFile(entry.DestPath)
+		if removedDestPath == "" {
+			removedDestPath = entry.DestPath
 		}
-	} else if removedDestPath != "" && !removedCompleted {
-		// DB row may not exist yet for active downloads; still remove partial file.
-		_ = state.RemoveIncompleteFile(removedDestPath)
-	}
-
-	if err := state.RemoveFromMasterList(id); err != nil {
-		return err
+		if entry.Status == "completed" {
+			removedCompleted = true
+		}
 	}
 
 	// Broadcast removal for multi-client UIs (including remote SSE clients).
@@ -779,6 +773,8 @@ func (s *LocalDownloadService) Delete(id string) error {
 		s.InputCh <- events.DownloadRemovedMsg{
 			DownloadID: id,
 			Filename:   removedFilename,
+			DestPath:   removedDestPath,
+			Completed:  removedCompleted,
 		}
 	}
 	return nil

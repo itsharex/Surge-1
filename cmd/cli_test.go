@@ -300,6 +300,38 @@ func TestReadURLsFromFile_WhitespaceAndInlineComments(t *testing.T) {
 	}
 }
 
+func TestReadURLsFromFile_DedupesTrailingSlashVariants(t *testing.T) {
+	tmpDir := t.TempDir()
+	urlFile := filepath.Join(tmpDir, "urls.txt")
+	content := strings.Join([]string{
+		"https://example.com/file.bin/",
+		"https://example.com/file.bin",
+		"https://example.com/file.bin///",
+		"https://example.com/other.bin",
+	}, "\n")
+	if err := os.WriteFile(urlFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("failed to write url file: %v", err)
+	}
+
+	urls, err := utils.ReadURLsFromFile(urlFile)
+	if err != nil {
+		t.Fatalf("ReadURLsFromFile returned error: %v", err)
+	}
+
+	want := []string{
+		"https://example.com/file.bin/",
+		"https://example.com/other.bin",
+	}
+	if len(urls) != len(want) {
+		t.Fatalf("expected %d urls, got %d (%v)", len(want), len(urls), urls)
+	}
+	for i := range want {
+		if urls[i] != want[i] {
+			t.Fatalf("url[%d] = %q, want %q", i, urls[i], want[i])
+		}
+	}
+}
+
 func TestReadURLsFromFile_LongLine(t *testing.T) {
 	tmpDir := t.TempDir()
 	urlFile := filepath.Join(tmpDir, "urls.txt")
@@ -756,8 +788,18 @@ func TestProcessDownloads_RemoteAndLocal(t *testing.T) {
 		GlobalPool = download.NewWorkerPool(GlobalProgressCh, 2)
 		GlobalService = core.NewLocalDownloadService(GlobalPool)
 
+		probeServer := testutil.NewHTTPServerT(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "5")
+			if r.Method == http.MethodGet {
+				_, _ = w.Write([]byte("hello"))
+				return
+			}
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}))
+		defer probeServer.Close()
+
 		count := processDownloads([]string{
-			"https://example.com/local.zip",
+			probeServer.URL + "/local.zip",
 			"",
 		}, t.TempDir(), 0)
 
@@ -773,6 +815,7 @@ func TestProcessDownloads_RemoteAndLocal(t *testing.T) {
 func setupIsolatedCmdState(t *testing.T) {
 	t.Helper()
 	setupXDGEnvIsolation(t)
+	resetGlobalEnqueueContext()
 
 	if err := config.EnsureDirs(); err != nil {
 		t.Fatalf("EnsureDirs failed: %v", err)

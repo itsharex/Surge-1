@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -19,6 +20,8 @@ import (
 	"github.com/surge-downloader/surge/internal/download"
 	"github.com/surge-downloader/surge/internal/engine/events"
 	"github.com/surge-downloader/surge/internal/engine/state"
+	"github.com/surge-downloader/surge/internal/engine/types"
+	"github.com/surge-downloader/surge/internal/processing"
 	"github.com/surge-downloader/surge/internal/tui"
 	"github.com/surge-downloader/surge/internal/utils"
 
@@ -36,6 +39,9 @@ var (
 // activeDownloads tracks the number of currently running downloads in headless mode
 var activeDownloads int32
 
+// pendingEnqueue tracks the number of pending batch enqueues to avoid premature exit
+var pendingEnqueue int32
+
 // Command line flags
 var (
 	verbose     bool
@@ -48,10 +54,219 @@ var (
 	GlobalPool              *download.WorkerPool
 	GlobalProgressCh        chan any
 	GlobalService           core.DownloadService
+	GlobalLifecycleCleanup  func()
 	serverProgram           *tea.Program
 	startupIntegrityMessage string
 	globalSettings          *config.Settings
+	GlobalLifecycle         *processing.LifecycleManager
+	globalLifecycleMu       sync.Mutex
+	globalEnqueueCtx        context.Context
+	globalEnqueueCancel     context.CancelFunc
+	globalEnqueueMu         sync.Mutex
 )
+
+func buildPoolIsNameActive(getAll func() []types.DownloadConfig) processing.IsNameActiveFunc {
+	if getAll == nil {
+		return nil
+	}
+
+	return func(dir, name string) bool {
+		dir = utils.EnsureAbsPath(strings.TrimSpace(dir))
+		name = strings.TrimSpace(name)
+		if dir == "" || name == "" {
+			return false
+		}
+
+		for _, cfg := range getAll() {
+			existingName := strings.TrimSpace(cfg.Filename)
+			existingDir := strings.TrimSpace(cfg.OutputPath)
+			if cfg.DestPath != "" {
+				existingDir = filepath.Dir(cfg.DestPath)
+				if existingName == "" {
+					existingName = filepath.Base(cfg.DestPath)
+				}
+			}
+			if cfg.State != nil {
+				if stateName := strings.TrimSpace(cfg.State.GetFilename()); stateName != "" {
+					existingName = stateName
+				}
+				if stateDestPath := strings.TrimSpace(cfg.State.GetDestPath()); stateDestPath != "" {
+					existingDir = filepath.Dir(stateDestPath)
+					if existingName == "" {
+						existingName = filepath.Base(stateDestPath)
+					}
+				}
+			}
+			if existingDir == "" || existingName == "" {
+				continue
+			}
+			if utils.EnsureAbsPath(existingDir) == dir && existingName == name {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func newLocalLifecycleManager(service core.DownloadService, getAll func() []types.DownloadConfig) *processing.LifecycleManager {
+	var addFunc processing.AddDownloadFunc
+	var addWithIDFunc processing.AddDownloadWithIDFunc
+	if service != nil {
+		addFunc = service.Add
+		addWithIDFunc = service.AddWithID
+	}
+
+	return processing.NewLifecycleManager(addFunc, addWithIDFunc, buildPoolIsNameActive(getAll))
+}
+
+func startLifecycleEventWorker(service core.DownloadService, mgr *processing.LifecycleManager) (func(), error) {
+	if service == nil || mgr == nil {
+		return nil, nil
+	}
+
+	managerStream, managerCleanup, err := service.StreamEvents(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	go mgr.StartEventWorker(managerStream)
+	return managerCleanup, nil
+}
+
+func currentLifecycle() *processing.LifecycleManager {
+	globalLifecycleMu.Lock()
+	defer globalLifecycleMu.Unlock()
+	return GlobalLifecycle
+}
+
+func resetGlobalEnqueueContext() {
+	globalEnqueueMu.Lock()
+	defer globalEnqueueMu.Unlock()
+	if globalEnqueueCancel != nil {
+		globalEnqueueCancel()
+	}
+	globalEnqueueCtx, globalEnqueueCancel = context.WithCancel(context.Background())
+}
+
+func ensureEnqueueContextLocked() {
+	if globalEnqueueCtx == nil || globalEnqueueCancel == nil {
+		globalEnqueueCtx, globalEnqueueCancel = context.WithCancel(context.Background())
+	}
+}
+
+func currentEnqueueContext() context.Context {
+	globalEnqueueMu.Lock()
+	defer globalEnqueueMu.Unlock()
+	ensureEnqueueContextLocked()
+	return globalEnqueueCtx
+}
+
+func currentEnqueueCancel() context.CancelFunc {
+	globalEnqueueMu.Lock()
+	defer globalEnqueueMu.Unlock()
+	ensureEnqueueContextLocked()
+	return globalEnqueueCancel
+}
+
+func cancelGlobalEnqueue() {
+	globalEnqueueMu.Lock()
+	cancel := globalEnqueueCancel
+	globalEnqueueMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func takeLifecycleCleanup() func() {
+	globalLifecycleMu.Lock()
+	defer globalLifecycleMu.Unlock()
+	cleanup := GlobalLifecycleCleanup
+	GlobalLifecycleCleanup = nil
+	return cleanup
+}
+
+func currentPoolConfigs() []types.DownloadConfig {
+	if GlobalPool == nil {
+		return nil
+	}
+	return GlobalPool.GetAll()
+}
+
+func lifecycleForLocalService(service core.DownloadService) (*processing.LifecycleManager, error) {
+	lifecycle := currentLifecycle()
+	if service == nil || GlobalService == nil || service != GlobalService {
+		return lifecycle, nil
+	}
+	return ensureLocalLifecycle(GlobalService, currentPoolConfigs)
+}
+
+func ensureGlobalLocalServiceAndLifecycle() error {
+	if GlobalService == nil {
+		GlobalService = core.NewLocalDownloadServiceWithInput(GlobalPool, GlobalProgressCh)
+	}
+	_, err := ensureLocalLifecycle(GlobalService, currentPoolConfigs)
+	return err
+}
+
+func publishSystemLog(message string) {
+	if GlobalService != nil {
+		_ = GlobalService.Publish(events.SystemLogMsg{Message: message})
+		return
+	}
+	fmt.Fprintln(os.Stderr, message)
+}
+
+func recordPreflightDownloadError(url, outPath string, err error) {
+	if err == nil || strings.TrimSpace(url) == "" {
+		return
+	}
+
+	filename := strings.TrimSpace(processing.InferFilenameFromURL(url))
+	destPath := ""
+	if filename != "" && strings.TrimSpace(outPath) != "" {
+		destPath = filepath.Join(outPath, filename)
+	}
+
+	entry := types.DownloadEntry{
+		ID:       uuid.New().String(),
+		URL:      url,
+		URLHash:  state.URLHash(url),
+		DestPath: destPath,
+		Filename: filename,
+		Status:   "error",
+	}
+	if addErr := state.AddToMasterList(entry); addErr != nil {
+		utils.Debug("Failed to persist preflight download error for %s: %v", url, addErr)
+	}
+	if GlobalService != nil {
+		_ = GlobalService.Publish(events.DownloadErrorMsg{
+			DownloadID: entry.ID,
+			Filename:   filename,
+			DestPath:   destPath,
+			Err:        err,
+		})
+	}
+}
+
+func ensureLocalLifecycle(service core.DownloadService, getAll func() []types.DownloadConfig) (*processing.LifecycleManager, error) {
+	globalLifecycleMu.Lock()
+	defer globalLifecycleMu.Unlock()
+
+	if GlobalLifecycle == nil {
+		GlobalLifecycle = newLocalLifecycleManager(service, getAll)
+	}
+	if GlobalLifecycleCleanup == nil {
+		cleanup, err := startLifecycleEventWorker(service, GlobalLifecycle)
+		if err != nil {
+			return nil, err
+		}
+		GlobalLifecycleCleanup = cleanup
+	}
+	return GlobalLifecycle, nil
+}
+
+func isExplicitOutputPath(outPath, defaultDir string) bool {
+	return utils.EnsureAbsPath(strings.TrimSpace(outPath)) != utils.EnsureAbsPath(strings.TrimSpace(defaultDir))
+}
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -100,11 +315,14 @@ var rootCmd = &cobra.Command{
 		}()
 
 		mustInitializeGlobalState()
+		resetGlobalEnqueueContext()
 
 		startupIntegrityMessage = runStartupIntegrityCheck()
 
-		// Initialize Service
-		GlobalService = core.NewLocalDownloadServiceWithInput(GlobalPool, GlobalProgressCh)
+		if err := ensureGlobalLocalServiceAndLifecycle(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating lifecycle event stream: %v\n", err)
+			os.Exit(1)
+		}
 
 		portFlag, _ := cmd.Flags().GetInt("port")
 		batchFile, _ := cmd.Flags().GetString("batch")
@@ -126,7 +344,9 @@ var rootCmd = &cobra.Command{
 		go startHTTPServer(listener, port, outputDir, GlobalService, "")
 
 		// Queue initial downloads if any
+		atomic.AddInt32(&pendingEnqueue, 1)
 		go func() {
+			defer atomic.AddInt32(&pendingEnqueue, -1)
 			var urls []string
 			urls = append(urls, args...)
 
@@ -170,7 +390,8 @@ func startTUI(port int, exitWhenDone bool, noResume bool) {
 	// Initialize TUI
 	// GlobalService and GlobalProgressCh are already initialized in PersistentPreRun or Run
 
-	m := tui.InitialRootModel(port, Version, GlobalService, noResume)
+	m := tui.InitialRootModel(port, Version, GlobalService, currentLifecycle(), noResume)
+	m = m.WithEnqueueContext(currentEnqueueContext(), currentEnqueueCancel())
 	m.ServerHost = serverBindHost
 	if m.ServerHost == "" {
 		m.ServerHost = "127.0.0.1"
@@ -211,7 +432,7 @@ func startTUI(port int, exitWhenDone bool, noResume bool) {
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
 			for range ticker.C {
-				if GlobalPool != nil && GlobalPool.ActiveCount() == 0 {
+				if atomic.LoadInt32(&pendingEnqueue) == 0 && GlobalPool != nil && GlobalPool.ActiveCount() == 0 {
 					// Send quit message to TUI
 					p.Send(tea.Quit())
 					return
@@ -455,6 +676,7 @@ type DownloadRequest struct {
 	Mirrors              []string          `json:"mirrors,omitempty"`
 	SkipApproval         bool              `json:"skip_approval,omitempty"` // Extension validated request, skip TUI prompt
 	Headers              map[string]string `json:"headers,omitempty"`       // Custom HTTP headers from browser (cookies, auth, etc.)
+	IsExplicitCategory   bool              `json:"is_explicit_category,omitempty"`
 }
 
 func handleDownload(w http.ResponseWriter, r *http.Request, defaultOutputDir string, service core.DownloadService) {
@@ -510,7 +732,6 @@ func handleDownload(w http.ResponseWriter, r *http.Request, defaultOutputDir str
 
 	utils.Debug("Received download request: URL=%s, Path=%s", req.URL, req.Path)
 
-	downloadID := uuid.New().String()
 	if service == nil {
 		http.Error(w, "Service unavailable", http.StatusInternalServerError)
 		return
@@ -533,18 +754,18 @@ func handleDownload(w http.ResponseWriter, r *http.Request, defaultOutputDir str
 		urlForAdd, mirrorsForAdd = ParseURLArg(req.URL)
 	}
 
-	if GlobalPool.HasDownload(urlForAdd) {
-		isDuplicate = true
-		// Check if specifically active\
-		allActive := GlobalPool.GetAll()
-		for _, c := range allActive {
-			if c.URL == urlForAdd {
-				if c.State != nil && !c.State.Done.Load() {
-					isActive = true
-				}
-				break
-			}
+	activeDownloadsFunc := func() map[string]*types.DownloadConfig {
+		active := make(map[string]*types.DownloadConfig)
+		for _, cfg := range GlobalPool.GetAll() {
+			c := cfg // create copy
+			active[c.ID] = &c
 		}
+		return active
+	}
+	dupResult := processing.CheckForDuplicate(urlForAdd, settings, activeDownloadsFunc)
+	if dupResult != nil {
+		isDuplicate = dupResult.Exists
+		isActive = dupResult.IsActive
 	}
 
 	utils.Debug("Download request: URL=%s, SkipApproval=%v, isDuplicate=%v, isActive=%v", urlForAdd, req.SkipApproval, isDuplicate, isActive)
@@ -567,6 +788,7 @@ func handleDownload(w http.ResponseWriter, r *http.Request, defaultOutputDir str
 				utils.Debug("Requesting TUI confirmation for: %s (Duplicate: %v)", req.URL, isDuplicate)
 
 				// Send request to TUI
+				downloadID := uuid.New().String()
 				if err := service.Publish(events.DownloadRequestMsg{
 					ID:       downloadID,
 					URL:      urlForAdd,
@@ -597,8 +819,26 @@ func handleDownload(w http.ResponseWriter, r *http.Request, defaultOutputDir str
 		}
 	}
 
-	// Add via service
-	newID, err := service.Add(urlForAdd, outPath, req.Filename, mirrorsForAdd, req.Headers)
+	lifecycle, err := lifecycleForLocalService(service)
+	if err != nil {
+		http.Error(w, "Failed to initialize lifecycle manager: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var newID string
+	if lifecycle != nil {
+		newID, err = lifecycle.Enqueue(r.Context(), &processing.DownloadRequest{
+			URL:                urlForAdd,
+			Filename:           req.Filename,
+			Path:               outPath,
+			Mirrors:            mirrorsForAdd,
+			Headers:            req.Headers,
+			IsExplicitCategory: req.IsExplicitCategory,
+			SkipApproval:       req.SkipApproval,
+		})
+	} else {
+		newID, err = service.Add(urlForAdd, outPath, req.Filename, mirrorsForAdd, req.Headers, req.IsExplicitCategory, 0, false)
+	}
 	if err != nil {
 		http.Error(w, "Failed to add download: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -646,6 +886,12 @@ func processDownloads(urls []string, outputDir string, port int) int {
 
 	settings := getSettings()
 
+	lifecycle, err := lifecycleForLocalService(GlobalService)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error: unable to initialize lifecycle manager:", err)
+		return 0
+	}
+
 	for _, arg := range urls {
 		// Validation
 		if arg == "" {
@@ -669,11 +915,24 @@ func processDownloads(urls []string, outputDir string, port int) int {
 		// But processDownloads is called from QUEUE init routine, primarily for CLI args.
 		// If CLI args provided, user probably wants them added immediately.
 
-		_, err := GlobalService.Add(url, outPath, "", mirrors, nil)
+		// CLI explicit arg means we do not auto-route when user provided an explicit output path.
+		isExplicit := isExplicitOutputPath(outPath, settings.General.DefaultDownloadDir)
+		if lifecycle == nil {
+			err := fmt.Errorf("lifecycle manager unavailable")
+			recordPreflightDownloadError(url, outPath, err)
+			publishSystemLog(fmt.Sprintf("Error adding %s: %v", url, err))
+			continue
+		}
+
+		_, err := lifecycle.Enqueue(currentEnqueueContext(), &processing.DownloadRequest{
+			URL:                url,
+			Path:               outPath,
+			Mirrors:            mirrors,
+			IsExplicitCategory: isExplicit,
+		})
 		if err != nil {
-			_ = GlobalService.Publish(events.SystemLogMsg{
-				Message: fmt.Sprintf("Error adding %s: %v", url, err),
-			})
+			recordPreflightDownloadError(url, outPath, err)
+			publishSystemLog(fmt.Sprintf("Error adding %s: %v", url, err))
 			continue
 		}
 		atomic.AddInt32(&activeDownloads, 1)

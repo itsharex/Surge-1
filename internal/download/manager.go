@@ -10,12 +10,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/surge-downloader/surge/internal/engine"
 	"github.com/surge-downloader/surge/internal/engine/concurrent"
 	"github.com/surge-downloader/surge/internal/engine/events"
 	"github.com/surge-downloader/surge/internal/engine/single"
-	"github.com/surge-downloader/surge/internal/engine/state"
 	"github.com/surge-downloader/surge/internal/engine/types"
+	"github.com/surge-downloader/surge/internal/processing"
 	"github.com/surge-downloader/surge/internal/utils"
 )
 
@@ -80,42 +79,13 @@ func uniqueFilePath(path string) string {
 	return path
 }
 
-// TUIDownload is the main entry point for TUI downloads
+// TUIDownload is the main entry point for downloads executed by the Engine pool
 func TUIDownload(ctx context.Context, cfg *types.DownloadConfig) error {
-	// Probe server once to get all metadata
-	utils.Debug("TUIDownload: Probing server... %s", cfg.URL)
-
-	probe, err := engine.ProbeServer(ctx, cfg.URL, cfg.Filename, cfg.Headers)
-	if err != nil {
-		utils.Debug("TUIDownload: Probe failed: %v\n", err)
-		return err
-	}
-	utils.Debug("TUIDownload: Probe success %d", probe.FileSize)
-
-	// Start download timer (exclude probing time)
 	start := time.Now()
-	defer func() {
-		utils.Debug("Download %s completed in %v", cfg.URL, time.Since(start))
-	}()
-
-	// Construct proper output path
+	// Engine expects cfg.OutputPath and cfg.Filename to be fully resolved by the processing layer
 	destPath := cfg.OutputPath
-
-	// Auto-create output directory if it doesn't exist
-	if _, err := os.Stat(cfg.OutputPath); os.IsNotExist(err) {
-		if mkErr := os.MkdirAll(cfg.OutputPath, 0o755); mkErr != nil {
-			utils.Debug("Failed to create output directory: %v", mkErr)
-		}
-	}
-
-	if info, err := os.Stat(cfg.OutputPath); err == nil && info.IsDir() {
-		// Use cfg.Filename if TUI provided one, otherwise use probe.Filename
-		filename := probe.Filename
-		if cfg.Filename != "" {
-			filename = cfg.Filename
-		}
-		destPath = filepath.Join(cfg.OutputPath, filename)
-	}
+	finalFilename := cfg.Filename
+	finalDestPath := filepath.Join(destPath, finalFilename)
 
 	// Local mirrors slice to avoid modifying config (race condition)
 	mirrors := make([]string, len(cfg.Mirrors))
@@ -127,9 +97,6 @@ func TUIDownload(ctx context.Context, cfg *types.DownloadConfig) error {
 	if cfg.IsResume && cfg.DestPath != "" {
 		if cfg.SavedState != nil {
 			savedState = cfg.SavedState
-		} else {
-			// Resume: use the provided destination path for state lookup
-			savedState, _ = state.LoadState(cfg.URL, cfg.DestPath)
 		}
 
 		// Restore mirrors from state if found
@@ -154,18 +121,15 @@ func TUIDownload(ctx context.Context, cfg *types.DownloadConfig) error {
 
 	if isResume {
 		// Resume: use saved destination path directly (don't generate new unique name)
-		destPath = savedState.DestPath
-		utils.Debug("Resuming download, using saved destPath: %s", destPath)
-	} else {
-		// Fresh download without TUI-provided filename: generate unique filename if file already exists
-		destPath = uniqueFilePath(destPath)
+		finalDestPath = savedState.DestPath
+		finalFilename = filepath.Base(finalDestPath)
+		utils.Debug("Resuming download, using saved destPath: %s", finalDestPath)
 	}
-	finalFilename := filepath.Base(destPath)
-	utils.Debug("Destination path: %s", destPath)
+	utils.Debug("Destination path: %s", finalDestPath)
 
 	if cfg.State != nil {
 		cfg.State.SetFilename(finalFilename)
-		cfg.State.SetDestPath(destPath)
+		cfg.State.SetDestPath(finalDestPath)
 	}
 
 	// Send download started message
@@ -174,20 +138,20 @@ func TUIDownload(ctx context.Context, cfg *types.DownloadConfig) error {
 			DownloadID: cfg.ID,
 			URL:        cfg.URL,
 			Filename:   finalFilename,
-			Total:      probe.FileSize,
-			DestPath:   destPath,
+			Total:      cfg.TotalSize, // Relies on TotalSize from Config
+			DestPath:   finalDestPath,
 			State:      cfg.State,
 		})
 	}
 
 	// Update shared state
 	if cfg.State != nil {
-		cfg.State.SetTotalSize(probe.FileSize)
+		cfg.State.SetTotalSize(cfg.TotalSize)
 	}
 
 	// Choose downloader based on probe results
 	var downloadErr error
-	if probe.SupportsRange && probe.FileSize > 0 {
+	if cfg.SupportsRange && cfg.TotalSize > 0 {
 		utils.Debug("Using concurrent downloader")
 
 		// We probe all candidate mirrors (mirrors) to filter out invalid ones
@@ -196,7 +160,7 @@ func TUIDownload(ctx context.Context, cfg *types.DownloadConfig) error {
 			utils.Debug("Probing %d mirrors", len(mirrors))
 			// Always check primary + mirrors to ensure we are using the best set
 			allToCheck := append([]string{cfg.URL}, mirrors...)
-			valid, errs := engine.ProbeMirrors(ctx, allToCheck)
+			valid, errs := processing.ProbeMirrorsWithProxy(ctx, allToCheck, cfg.Runtime.ProxyURL)
 
 			// Log errors
 			for u, e := range errs {
@@ -215,13 +179,13 @@ func TUIDownload(ctx context.Context, cfg *types.DownloadConfig) error {
 		d := concurrent.NewConcurrentDownloader(cfg.ID, cfg.ProgressCh, cfg.State, cfg.Runtime)
 		d.Headers = cfg.Headers // Forward custom headers from browser extension
 		utils.Debug("Calling Download with mirrors: %v", mirrors)
-		downloadErr = d.Download(ctx, cfg.URL, mirrors, activeMirrors, destPath, probe.FileSize)
+		downloadErr = d.Download(ctx, cfg.URL, mirrors, activeMirrors, finalDestPath, cfg.TotalSize)
 	} else {
 		// Fallback to single-threaded downloader
 		utils.Debug("Using single-threaded downloader")
 		d := single.NewSingleDownloader(cfg.ID, cfg.ProgressCh, cfg.State, cfg.Runtime)
 		d.Headers = cfg.Headers // Forward custom headers from browser extension
-		downloadErr = d.Download(ctx, cfg.URL, destPath, probe.FileSize, probe.Filename)
+		downloadErr = d.Download(ctx, cfg.URL, finalDestPath, cfg.TotalSize, finalFilename)
 	}
 
 	// Only send completion if NO error AND not paused
@@ -235,7 +199,7 @@ func TUIDownload(ctx context.Context, cfg *types.DownloadConfig) error {
 	if downloadErr == nil && !isPaused {
 		var elapsed time.Duration
 		if cfg.State != nil {
-			_, elapsed = cfg.State.FinalizeSession(probe.FileSize)
+			_, elapsed = cfg.State.FinalizeSession(cfg.TotalSize)
 		} else {
 			elapsed = time.Since(start)
 		}
@@ -244,23 +208,7 @@ func TUIDownload(ctx context.Context, cfg *types.DownloadConfig) error {
 		// Compute average download speed in bytes/sec
 		var avgSpeed float64
 		if elapsed.Seconds() > 0 {
-			avgSpeed = float64(probe.FileSize) / elapsed.Seconds()
-		}
-
-		if err := state.AddToMasterList(types.DownloadEntry{
-			ID:          cfg.ID,
-			URL:         cfg.URL,
-			URLHash:     state.URLHash(cfg.URL),
-			DestPath:    destPath,
-			Filename:    finalFilename,
-			Status:      "completed",
-			TotalSize:   probe.FileSize,
-			Downloaded:  probe.FileSize,
-			CompletedAt: time.Now().Unix(),
-			TimeTaken:   elapsed.Milliseconds(),
-			AvgSpeed:    avgSpeed,
-		}); err != nil {
-			utils.Debug("Failed to persist completed download: %v", err)
+			avgSpeed = float64(cfg.TotalSize) / elapsed.Seconds()
 		}
 
 		if cfg.ProgressCh != nil {
@@ -268,7 +216,7 @@ func TUIDownload(ctx context.Context, cfg *types.DownloadConfig) error {
 				DownloadID: cfg.ID,
 				Filename:   finalFilename,
 				Elapsed:    elapsed,
-				Total:      probe.FileSize,
+				Total:      cfg.TotalSize,
 				AvgSpeed:   avgSpeed,
 			})
 		}
@@ -279,23 +227,14 @@ func TUIDownload(ctx context.Context, cfg *types.DownloadConfig) error {
 			return nil
 		}
 
-		downloaded := int64(0)
-		if cfg.State != nil {
-			downloaded = cfg.State.Downloaded.Load()
-		}
-
-		// Persist error state
-		if err := state.AddToMasterList(types.DownloadEntry{
-			ID:         cfg.ID,
-			URL:        cfg.URL,
-			URLHash:    state.URLHash(cfg.URL),
-			DestPath:   destPath,
-			Filename:   finalFilename,
-			Status:     "error",
-			TotalSize:  probe.FileSize,
-			Downloaded: downloaded,
-		}); err != nil {
-			utils.Debug("Failed to persist error state: %v", err)
+		// Send error event
+		if cfg.ProgressCh != nil {
+			safeSendProgress(cfg.ProgressCh, events.DownloadErrorMsg{
+				DownloadID: cfg.ID,
+				Filename:   finalFilename,
+				DestPath:   finalDestPath,
+				Err:        downloadErr,
+			})
 		}
 	}
 

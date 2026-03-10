@@ -113,13 +113,14 @@ func (p *WorkerPool) Add(cfg types.DownloadConfig) {
 			Filename:   cfg.Filename,
 			URL:        cfg.URL,
 			DestPath:   resolveDestPath(&cfg),
+			Mirrors:    append([]string(nil), cfg.Mirrors...),
 		})
 	}
 
 	p.taskChan <- cfg
 }
 
-// HasDownload checks if a download with the given URL already exists
+// HasDownload reports whether a download with the given URL is currently active or queued in the pool.
 func (p *WorkerPool) HasDownload(url string) bool {
 	p.mu.RLock()
 	for _, ad := range p.downloads {
@@ -136,9 +137,7 @@ func (p *WorkerPool) HasDownload(url string) bool {
 	}
 	p.mu.RUnlock()
 
-	// Check persistent store
-	exists, err := state.CheckDownloadExists(url)
-	return err == nil && exists
+	return false
 }
 
 // ActiveCount returns the number of currently active (downloading/pausing) downloads
@@ -313,6 +312,19 @@ func (p *WorkerPool) Resume(downloadID string) bool {
 		syncConfigFromState(&ad.config)
 	}
 
+	// Hydrate resume config from persisted pause snapshot when available.
+	if ad.config.URL != "" && ad.config.DestPath != "" {
+		if saved, err := state.LoadState(ad.config.URL, ad.config.DestPath); err == nil && saved != nil {
+			ad.config.SavedState = saved
+			if saved.TotalSize > 0 {
+				ad.config.TotalSize = saved.TotalSize
+			}
+			if len(saved.Tasks) > 0 {
+				ad.config.SupportsRange = true
+			}
+		}
+	}
+
 	// Re-queue the download
 	ad.config.IsResume = true
 	p.Add(ad.config)
@@ -347,14 +359,12 @@ func (p *WorkerPool) UpdateURL(downloadID string, newURL string) error {
 
 		// Update the active download's config
 		ad.config.URL = newURL
+		if ad.config.State != nil {
+			ad.config.State.SetURL(newURL)
+		}
 	}
 
-	// Update persistent state and master list
-	if err := state.UpdateURL(downloadID, newURL); err != nil {
-		return err
-	}
-
-	return nil
+	return state.UpdateURL(downloadID, newURL)
 }
 
 func (p *WorkerPool) worker() {
@@ -409,6 +419,7 @@ func (p *WorkerPool) worker() {
 			p.trySendProgress(events.DownloadErrorMsg{
 				DownloadID: cfg.ID,
 				Filename:   cfg.Filename,
+				DestPath:   resolveDestPath(&cfg),
 				Err:        err,
 			})
 			// Clean up errored download from tracking (don't save to .surge)
@@ -588,32 +599,6 @@ func (p *WorkerPool) GracefulShutdown() {
 }
 
 func (p *WorkerPool) persistQueuedForShutdown() {
-	p.mu.RLock()
-	queued := make([]types.DownloadConfig, 0, len(p.queued))
-	for _, cfg := range p.queued {
-		queued = append(queued, cfg)
-	}
-	p.mu.RUnlock()
-
-	for _, cfg := range queued {
-		if cfg.ID == "" || cfg.URL == "" {
-			continue
-		}
-
-		syncConfigFromState(&cfg)
-
-		if err := state.AddToMasterList(types.DownloadEntry{
-			ID:         cfg.ID,
-			URL:        cfg.URL,
-			URLHash:    state.URLHash(cfg.URL),
-			DestPath:   resolveDestPath(&cfg),
-			Filename:   cfg.Filename,
-			Status:     "queued",
-			TotalSize:  0,
-			Downloaded: 0,
-			Mirrors:    cfg.Mirrors,
-		}); err != nil {
-			utils.Debug("GracefulShutdown: failed to persist queued download %s: %v", cfg.ID, err)
-		}
-	}
+	// No-op: queued items are persisted when Add emits DownloadQueuedMsg,
+	// so shutdown only needs to drain active workers.
 }

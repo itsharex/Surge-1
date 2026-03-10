@@ -12,6 +12,7 @@ import (
 	"github.com/surge-downloader/surge/internal/engine/events"
 	"github.com/surge-downloader/surge/internal/engine/state"
 	"github.com/surge-downloader/surge/internal/engine/types"
+	"github.com/surge-downloader/surge/internal/processing"
 )
 
 // TestStateSync verifies that the TUI uses the shared state object
@@ -33,7 +34,7 @@ func TestStateSync(t *testing.T) {
 	pool := download.NewWorkerPool(progressChan, 1)
 
 	// Initialize model with progress channel and service
-	m := InitialRootModel(1700, "test-version", core.NewLocalDownloadServiceWithInput(pool, progressChan), false)
+	m := InitialRootModel(1700, "test-version", core.NewLocalDownloadServiceWithInput(pool, progressChan), processing.NewLifecycleManager(nil, nil), false)
 
 	downloadID := "external-id"
 	// Create the "worker" state - this is the source of truth

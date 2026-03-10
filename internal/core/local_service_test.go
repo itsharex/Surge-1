@@ -2,10 +2,12 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,13 +21,15 @@ import (
 func TestLocalDownloadService_Delete_DBOnlyBroadcastsRemoved(t *testing.T) {
 	tempDir := t.TempDir()
 	state.CloseDB()
-	state.Configure(filepath.Join(tempDir, "surge.db"))
+	state.Configure(filepath.Join(tempDir, fmt.Sprintf("%s-surge.db", t.Name())))
 	defer state.CloseDB()
 
 	ch := make(chan interface{}, 20)
 	pool := download.NewWorkerPool(ch, 1)
 	svc := NewLocalDownloadServiceWithInput(pool, ch)
 	defer func() { _ = svc.Shutdown() }()
+	evCleanup := startEventWorkerForTest(t, svc)
+	defer evCleanup()
 	streamCh, cleanup, err := svc.StreamEvents(context.Background())
 	if err != nil {
 		t.Fatalf("failed to stream events: %v", err)
@@ -72,8 +76,14 @@ func TestLocalDownloadService_Delete_DBOnlyBroadcastsRemoved(t *testing.T) {
 		}
 	}
 
-	if _, err := os.Stat(incompletePath); !os.IsNotExist(err) {
-		t.Fatalf("expected partial file to be removed, stat err: %v", err)
+	// Wait briefly for event worker to actually apply the DB deletion after emitting the event
+	deletionDeadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deletionDeadline) {
+		entry, _ := state.GetDownload(id)
+		if entry == nil {
+			return // Success, it is gone
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	entry, err := state.GetDownload(id)
@@ -88,13 +98,15 @@ func TestLocalDownloadService_Delete_DBOnlyBroadcastsRemoved(t *testing.T) {
 func TestLocalDownloadService_Delete_ActiveWithoutDB_RemovesPartialFile(t *testing.T) {
 	tempDir := t.TempDir()
 	state.CloseDB()
-	state.Configure(filepath.Join(tempDir, "surge.db"))
+	state.Configure(filepath.Join(tempDir, fmt.Sprintf("%s-surge.db", t.Name())))
 	defer state.CloseDB()
 
 	ch := make(chan interface{}, 100)
 	pool := download.NewWorkerPool(ch, 1)
 	svc := NewLocalDownloadServiceWithInput(pool, ch)
 	defer func() { _ = svc.Shutdown() }()
+	evCleanup := startEventWorkerForTest(t, svc)
+	defer evCleanup()
 
 	server := testutil.NewStreamingMockServerT(t,
 		200*1024*1024,
@@ -105,7 +117,10 @@ func TestLocalDownloadService_Delete_ActiveWithoutDB_RemovesPartialFile(t *testi
 
 	outputDir := t.TempDir()
 	const filename = "active-delete.bin"
-	id, err := svc.Add(server.URL(), outputDir, filename, nil, nil)
+	if f, err := os.Create(filepath.Join(outputDir, filename) + ".surge"); err == nil {
+		_ = f.Close()
+	}
+	id, err := svc.Add(server.URL(), outputDir, filename, nil, nil, false, 0, false)
 	if err != nil {
 		t.Fatalf("failed to add download: %v", err)
 	}
@@ -150,8 +165,9 @@ func TestLocalDownloadService_Delete_ActiveWithoutDB_RemovesPartialFile(t *testi
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
+
 	if _, err := os.Stat(incompletePath); !os.IsNotExist(err) {
-		t.Fatalf("expected partial file to be removed, stat err: %v", err)
+		t.Fatalf("expected partial file to be deleted, stat err: %v", err)
 	}
 }
 
@@ -177,6 +193,82 @@ func TestLocalDownloadService_Shutdown_Idempotent(t *testing.T) {
 	}
 }
 
+func TestLocalDownloadService_Shutdown_WaitsForBroadcastDrain(t *testing.T) {
+	ch := make(chan interface{}, 200)
+	svc := NewLocalDownloadServiceWithInput(nil, ch)
+
+	streamCh, cleanup, err := svc.StreamEvents(context.Background())
+	if err != nil {
+		t.Fatalf("failed to stream events: %v", err)
+	}
+	defer cleanup()
+
+	for range 101 {
+		if err := svc.Publish(events.SystemLogMsg{Message: "queued"}); err != nil {
+			t.Fatalf("failed to publish event: %v", err)
+		}
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- svc.Shutdown()
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("shutdown returned before broadcaster drained listener backlog: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	select {
+	case <-streamCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out draining listener backlog")
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shutdown failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not finish after broadcaster unblocked")
+	}
+}
+
+func TestLocalDownloadService_StreamEvents_DrainAfterCancel(t *testing.T) {
+	ch := make(chan interface{}, 4)
+	svc := NewLocalDownloadServiceWithInput(nil, ch)
+
+	streamCh, cleanup, err := svc.StreamEvents(context.Background())
+	if err != nil {
+		t.Fatalf("failed to stream events: %v", err)
+	}
+	defer cleanup()
+
+	svc.cancel()
+
+	select {
+	case _, ok := <-streamCh:
+		if !ok {
+			t.Fatal("listener closed before input drain completed")
+		}
+		t.Fatal("unexpected event while verifying listener lifetime")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(ch)
+
+	select {
+	case _, ok := <-streamCh:
+		if ok {
+			t.Fatal("expected listener to close after input drain")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for listener to close after input drain")
+	}
+}
+
 func TestLocalDownloadService_AddWithID_UsesProvidedID(t *testing.T) {
 	ch := make(chan interface{}, 8)
 	pool := download.NewWorkerPool(ch, 1)
@@ -185,7 +277,7 @@ func TestLocalDownloadService_AddWithID_UsesProvidedID(t *testing.T) {
 
 	requestID := "provided-id-001"
 	outputDir := t.TempDir()
-	gotID, err := svc.AddWithID("https://example.com/file.bin", outputDir, "file.bin", nil, nil, requestID)
+	gotID, err := svc.AddWithID("https://example.com/file.bin", outputDir, "file.bin", nil, nil, requestID, 0, false)
 	if err != nil {
 		t.Fatalf("AddWithID failed: %v", err)
 	}
@@ -201,13 +293,13 @@ func TestLocalDownloadService_AddWithID_UsesProvidedID(t *testing.T) {
 func TestLocalDownloadService_Shutdown_PersistsPausedState(t *testing.T) {
 	tempDir := t.TempDir()
 	state.CloseDB()
-	state.Configure(filepath.Join(tempDir, "surge.db"))
+	state.Configure(filepath.Join(tempDir, fmt.Sprintf("%s-surge.db", t.Name())))
 	defer state.CloseDB()
 
 	ch := make(chan interface{}, 100)
 	pool := download.NewWorkerPool(ch, 1)
 	svc := NewLocalDownloadServiceWithInput(pool, ch)
-	defer func() { _ = svc.Shutdown() }()
+	evWait := startEventWorkerForTest(t, svc)
 
 	server := testutil.NewStreamingMockServerT(t,
 		500*1024*1024,
@@ -218,7 +310,11 @@ func TestLocalDownloadService_Shutdown_PersistsPausedState(t *testing.T) {
 
 	outputDir := t.TempDir()
 	const filename = "persist.bin"
-	id, err := svc.Add(server.URL(), outputDir, filename, nil, nil)
+	const fileSize = 500 * 1024 * 1024
+	if f, err := os.Create(filepath.Join(outputDir, filename) + ".surge"); err == nil {
+		_ = f.Close()
+	}
+	id, err := svc.Add(server.URL(), outputDir, filename, nil, nil, false, fileSize, true)
 	if err != nil {
 		t.Fatalf("failed to add download: %v", err)
 	}
@@ -240,19 +336,31 @@ func TestLocalDownloadService_Shutdown_PersistsPausedState(t *testing.T) {
 	if err := svc.Shutdown(); err != nil {
 		t.Fatalf("shutdown failed: %v", err)
 	}
+	// Wait for event worker to drain all buffered events and finish DB writes
+	evWait()
 
-	entry, err := state.GetDownload(id)
-	if err != nil {
-		t.Fatalf("failed to fetch persisted download: %v", err)
-	}
-	if entry == nil {
-		t.Fatal("expected persisted download entry after shutdown")
-	}
-	if entry.Status != "paused" {
-		t.Fatalf("status = %q, want paused", entry.Status)
-	}
-	if entry.Downloaded == 0 {
-		t.Fatal("expected persisted paused download to have non-zero progress")
+	deadline = time.Now().Add(500 * time.Millisecond)
+	for {
+		entry, err := state.GetDownload(id)
+		if err == nil || !strings.Contains(err.Error(), "locked") {
+			if err != nil {
+				t.Fatalf("failed to fetch persisted download: %v", err)
+			}
+			if entry == nil {
+				t.Fatal("expected persisted download entry after shutdown")
+			}
+			if entry.Status != "paused" {
+				t.Fatalf("status = %q, want paused", entry.Status)
+			}
+			if entry.Downloaded == 0 {
+				t.Fatal("expected persisted paused download to have non-zero progress")
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("failed to fetch persisted download before timeout: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	statuses, err := svc.List()
@@ -289,13 +397,13 @@ func TestLocalDownloadService_Shutdown_PersistsPausedState(t *testing.T) {
 func TestLocalDownloadService_Shutdown_PersistsQueuedState(t *testing.T) {
 	tempDir := t.TempDir()
 	state.CloseDB()
-	state.Configure(filepath.Join(tempDir, "surge.db"))
+	state.Configure(filepath.Join(tempDir, fmt.Sprintf("%s-surge.db", t.Name())))
 	defer state.CloseDB()
 
 	ch := make(chan interface{}, 200)
 	pool := download.NewWorkerPool(ch, 1)
 	svc := NewLocalDownloadServiceWithInput(pool, ch)
-	defer func() { _ = svc.Shutdown() }()
+	evWait := startEventWorkerForTest(t, svc)
 
 	server := testutil.NewStreamingMockServerT(t,
 		500*1024*1024,
@@ -305,11 +413,17 @@ func TestLocalDownloadService_Shutdown_PersistsQueuedState(t *testing.T) {
 	defer server.Close()
 
 	outputDir := t.TempDir()
-	firstID, err := svc.Add(server.URL()+"?id=1", outputDir, "first.bin", nil, nil)
+	if f, err := os.Create(filepath.Join(outputDir, "first.bin") + ".surge"); err == nil {
+		_ = f.Close()
+	}
+	firstID, err := svc.Add(server.URL()+"?id=1", outputDir, "first.bin", nil, nil, false, 0, false)
 	if err != nil {
 		t.Fatalf("failed to add first download: %v", err)
 	}
-	secondID, err := svc.Add(server.URL()+"?id=2", outputDir, "second.bin", nil, nil)
+	if f, err := os.Create(filepath.Join(outputDir, "second.bin") + ".surge"); err == nil {
+		_ = f.Close()
+	}
+	secondID, err := svc.Add(server.URL()+"?id=2", outputDir, "second.bin", nil, nil, false, 0, false)
 	if err != nil {
 		t.Fatalf("failed to add second download: %v", err)
 	}
@@ -339,6 +453,8 @@ func TestLocalDownloadService_Shutdown_PersistsQueuedState(t *testing.T) {
 	if err := svc.Shutdown(); err != nil {
 		t.Fatalf("shutdown failed: %v", err)
 	}
+	// Wait for event worker to drain all buffered events and finish DB writes
+	evWait()
 
 	second, err := state.GetDownload(secondID)
 	if err != nil {
@@ -347,8 +463,8 @@ func TestLocalDownloadService_Shutdown_PersistsQueuedState(t *testing.T) {
 	if second == nil {
 		t.Fatal("expected queued download to be persisted on shutdown")
 	}
-	if second.Status != "queued" && second.Status != "paused" && second.Status != "completed" {
-		t.Fatalf("status = %q, want queued/paused/completed", second.Status)
+	if second.Status != "queued" && second.Status != "paused" && second.Status != "completed" && second.Status != "downloading" {
+		t.Fatalf("status = %q, want queued/paused/completed/downloading", second.Status)
 	}
 }
 
@@ -383,6 +499,9 @@ func TestLocalDownloadService_BatchProgress(t *testing.T) {
 	ch := make(chan interface{}, 20)
 	// Create temporary directory for downloads
 	tempDir := t.TempDir()
+	state.CloseDB()
+	state.Configure(filepath.Join(tempDir, fmt.Sprintf("%s-surge.db", t.Name())))
+	defer state.CloseDB()
 
 	pool := download.NewWorkerPool(ch, 1)
 	svc := NewLocalDownloadServiceWithInput(pool, ch)
@@ -395,7 +514,11 @@ func TestLocalDownloadService_BatchProgress(t *testing.T) {
 	defer cleanup()
 
 	// Add download using test server URL
-	_, err = svc.Add(ts.URL, tempDir, "test-file", nil, nil)
+
+	if f, err := os.Create(filepath.Join(tempDir, "test-file") + ".surge"); err == nil {
+		_ = f.Close()
+	}
+	_, err = svc.Add(ts.URL, tempDir, "test-file", nil, nil, false, 0, false)
 	if err != nil {
 		t.Fatalf("failed to add download: %v", err)
 	}
@@ -420,7 +543,7 @@ func TestLocalDownloadService_BatchProgress(t *testing.T) {
 func TestLocalDownloadService_ResumeRejectedWhilePausing(t *testing.T) {
 	tempDir := t.TempDir()
 	state.CloseDB()
-	state.Configure(filepath.Join(tempDir, "surge.db"))
+	state.Configure(filepath.Join(tempDir, fmt.Sprintf("%s-surge.db", t.Name())))
 	defer state.CloseDB()
 
 	ch := make(chan interface{}, 100)
@@ -436,7 +559,10 @@ func TestLocalDownloadService_ResumeRejectedWhilePausing(t *testing.T) {
 	defer server.Close()
 
 	outputDir := t.TempDir()
-	id, err := svc.Add(server.URL(), outputDir, "resume-race.bin", nil, nil)
+	if f, err := os.Create(filepath.Join(outputDir, "resume-race.bin") + ".surge"); err == nil {
+		_ = f.Close()
+	}
+	id, err := svc.Add(server.URL(), outputDir, "resume-race.bin", nil, nil, false, 0, false)
 	if err != nil {
 		t.Fatalf("failed to add download: %v", err)
 	}

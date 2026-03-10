@@ -121,14 +121,44 @@ func (s *RemoteDownloadService) GetStatus(id string) (*types.DownloadStatus, err
 }
 
 // Add queues a new download.
-func (s *RemoteDownloadService) Add(url string, path string, filename string, mirrors []string, headers map[string]string) (string, error) {
+func (s *RemoteDownloadService) Add(url string, path string, filename string, mirrors []string, headers map[string]string, isExplicitCategory bool, totalSize int64, supportsRange bool) (string, error) {
 	req := map[string]interface{}{
-		"url":           url,
-		"path":          path,
-		"filename":      filename,
-		"mirrors":       mirrors,
-		"headers":       headers,
-		"skip_approval": true,
+		"url":                  url,
+		"path":                 path,
+		"filename":             filename,
+		"mirrors":              mirrors,
+		"headers":              headers,
+		"skip_approval":        true,
+		"is_explicit_category": isExplicitCategory,
+		"total_size":           totalSize,
+		"supports_range":       supportsRange,
+	}
+
+	resp, err := s.doRequest("POST", "/download", req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var result map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	return result["id"], nil
+}
+
+// AddWithID queues a new download with a caller-provided id.
+func (s *RemoteDownloadService) AddWithID(url string, path string, filename string, mirrors []string, headers map[string]string, id string, totalSize int64, supportsRange bool) (string, error) {
+	req := map[string]interface{}{
+		"url":            url,
+		"path":           path,
+		"filename":       filename,
+		"mirrors":        mirrors,
+		"headers":        headers,
+		"skip_approval":  true,
+		"id":             id,
+		"total_size":     totalSize,
+		"supports_range": supportsRange,
 	}
 
 	resp, err := s.doRequest("POST", "/download", req)

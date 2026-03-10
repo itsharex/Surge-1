@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/surge-downloader/surge/internal/engine/events"
 	"github.com/surge-downloader/surge/internal/engine/state"
 	"github.com/surge-downloader/surge/internal/engine/types"
 	"github.com/surge-downloader/surge/internal/utils"
@@ -259,6 +260,9 @@ func (d *ConcurrentDownloader) Download(ctx context.Context, rawurl string, cand
 
 	// Initialize mirror status in state
 	if d.State != nil {
+		d.State.SetURL(rawurl)
+		d.State.SetDestPath(destPath)
+
 		var statuses []types.MirrorStatus
 		// Add primary
 		statuses = append(statuses, types.MirrorStatus{URL: rawurl, Active: true})
@@ -312,10 +316,10 @@ func (d *ConcurrentDownloader) Download(ctx context.Context, rawurl string, cand
 		d.State.InitBitmap(fileSize, chunkSize)
 	}
 
-	// Create and preallocate output file with .surge suffix
-	outFile, err := os.OpenFile(workingPath, os.O_CREATE|os.O_RDWR, 0o644)
+	// Open existing output file with .surge suffix (must be created by processing layer)
+	outFile, err := os.OpenFile(workingPath, os.O_RDWR, 0)
 	if err != nil {
-		return fmt.Errorf("failed to create file: %w", err)
+		return fmt.Errorf("failed to open working file: %w", err)
 	}
 	defer func() {
 		if err := outFile.Close(); err != nil {
@@ -331,22 +335,6 @@ func (d *ConcurrentDownloader) Download(ctx context.Context, rawurl string, cand
 		// Close file before renaming
 		_ = outFile.Close()
 
-		// Rename from .surge to final destination
-		if err := os.Rename(workingPath, destPath); err != nil {
-			// Check for race condition: did someone else already rename it?
-			if os.IsNotExist(err) {
-				if info, statErr := os.Stat(destPath); statErr == nil && info.Size() == fileSize {
-					utils.Debug("Race condition detected: File already exists and has correct size. Treating as success.")
-					// Clean up state just in case, though usually done by caller
-					_ = state.DeleteState(d.ID)
-					return nil
-				}
-			}
-			return fmt.Errorf("failed to rename completed file: %w", err)
-		}
-
-		// Delete state file on successful completion
-		_ = state.DeleteState(d.ID)
 		return nil
 	}
 
@@ -585,8 +573,13 @@ func (d *ConcurrentDownloader) Download(ctx context.Context, rawurl string, cand
 			ChunkBitmap:     chunkBitmap,
 			ActualChunkSize: actualChunkSize,
 		}
-		if err := state.SaveState(d.URL, destPath, s); err != nil {
-			utils.Debug("Failed to save pause state: %v", err)
+		if d.ProgressChan != nil {
+			d.ProgressChan <- events.DownloadPausedMsg{
+				DownloadID: d.ID,
+				Filename:   filepath.Base(destPath),
+				Downloaded: computedDownloaded,
+				State:      s,
+			}
 		}
 
 		utils.Debug("Download paused, state saved (Downloaded=%d, RemainingTasks=%d, RemainingBytes=%d)",

@@ -10,6 +10,7 @@ import (
 
 	"github.com/surge-downloader/surge/internal/engine/types"
 	"github.com/surge-downloader/surge/internal/testutil"
+	"github.com/surge-downloader/surge/internal/utils"
 )
 
 func TestCopyFile(t *testing.T) {
@@ -27,7 +28,7 @@ func TestCopyFile(t *testing.T) {
 
 	dstPath := filepath.Join(tmpDir, "dst.bin")
 
-	err = copyFile(srcPath, dstPath)
+	err = utils.CopyFile(srcPath, dstPath)
 	if err != nil {
 		t.Fatalf("copyFile failed: %v", err)
 	}
@@ -58,7 +59,7 @@ func TestCopyFile_SourceNotExists(t *testing.T) {
 	tmpDir, cleanup, _ := testutil.TempDir("surge-copy-test")
 	defer cleanup()
 
-	err := copyFile(filepath.Join(tmpDir, "nonexistent.bin"), filepath.Join(tmpDir, "dst.bin"))
+	err := utils.CopyFile(filepath.Join(tmpDir, "nonexistent.bin"), filepath.Join(tmpDir, "dst.bin"))
 	if err == nil {
 		t.Error("Expected error for nonexistent source")
 	}
@@ -71,7 +72,7 @@ func TestCopyFile_InvalidDestination(t *testing.T) {
 	srcPath, _ := testutil.CreateTestFile(tmpDir, "src.bin", 100, false)
 
 	// Try to copy to an invalid path (non-existent directory)
-	err := copyFile(srcPath, filepath.Join(tmpDir, "nonexistent", "subdir", "dst.bin"))
+	err := utils.CopyFile(srcPath, filepath.Join(tmpDir, "nonexistent", "subdir", "dst.bin"))
 	if err == nil {
 		t.Error("Expected error for invalid destination")
 	}
@@ -84,7 +85,7 @@ func TestCopyFile_EmptyFile(t *testing.T) {
 	srcPath, _ := testutil.CreateTestFile(tmpDir, "empty.bin", 0, false)
 	dstPath := filepath.Join(tmpDir, "empty_copy.bin")
 
-	err := copyFile(srcPath, dstPath)
+	err := utils.CopyFile(srcPath, dstPath)
 	if err != nil {
 		t.Fatalf("copyFile failed for empty file: %v", err)
 	}
@@ -102,7 +103,7 @@ func TestCopyFile_LargeFile(t *testing.T) {
 	srcPath, _ := testutil.CreateTestFile(tmpDir, "large.bin", size, false)
 	dstPath := filepath.Join(tmpDir, "large_copy.bin")
 
-	err := copyFile(srcPath, dstPath)
+	err := utils.CopyFile(srcPath, dstPath)
 	if err != nil {
 		t.Fatalf("copyFile failed for large file: %v", err)
 	}
@@ -120,7 +121,7 @@ func TestCopyFile_ContentVerification(t *testing.T) {
 	srcPath, _ := testutil.CreateTestFile(tmpDir, "random.bin", size, true) // Random data
 	dstPath := filepath.Join(tmpDir, "random_copy.bin")
 
-	err := copyFile(srcPath, dstPath)
+	err := utils.CopyFile(srcPath, dstPath)
 	if err != nil {
 		t.Fatalf("copyFile failed: %v", err)
 	}
@@ -185,12 +186,17 @@ func TestSingleDownloader_StreamingServer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	// Pre-create incomplete file (simulating processing layer)
+	if f, err := os.Create(destPath + ".surge"); err == nil {
+		_ = f.Close()
+	}
+
 	err := downloader.Download(ctx, server.URL(), destPath, fileSize, "stream.bin")
 	if err != nil {
 		t.Fatalf("Streaming download failed: %v", err)
 	}
 
-	if err := testutil.VerifyFileSize(destPath, fileSize); err != nil {
+	if err := testutil.VerifyFileSize(destPath+types.IncompleteSuffix, fileSize); err != nil {
 		t.Error(err)
 	}
 }
@@ -220,6 +226,11 @@ func TestSingleDownloader_FailAfterBytes(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+
+	// Pre-create incomplete file (simulating processing layer)
+	if f, err := os.Create(destPath + ".surge"); err == nil {
+		_ = f.Close()
+	}
 
 	err := downloader.Download(ctx, server.URL(), destPath, fileSize, "failafter.bin")
 	// Should fail since SingleDownloader doesn't retry
@@ -258,12 +269,17 @@ func TestSingleDownloader_NilState(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Pre-create incomplete file (simulating processing layer)
+	if f, err := os.Create(destPath + ".surge"); err == nil {
+		_ = f.Close()
+	}
+
 	err := downloader.Download(ctx, server.URL(), destPath, fileSize, "nilstate.bin")
 	if err != nil {
 		t.Fatalf("Download with nil state failed: %v", err)
 	}
 
-	if err := testutil.VerifyFileSize(destPath, fileSize); err != nil {
+	if err := testutil.VerifyFileSize(destPath+types.IncompleteSuffix, fileSize); err != nil {
 		t.Error(err)
 	}
 }
@@ -348,20 +364,19 @@ func TestSingleDownloader_Download_Success(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Pre-create incomplete file (simulating processing layer)
+	if f, err := os.Create(destPath + ".surge"); err == nil {
+		_ = f.Close()
+	}
+
 	err = downloader.Download(ctx, server.URL(), destPath, fileSize, "single_test.bin")
 	if err != nil {
 		t.Fatalf("Download failed: %v", err)
 	}
 
 	// Verify file exists and has correct size
-	if err := testutil.VerifyFileSize(destPath, fileSize); err != nil {
+	if err := testutil.VerifyFileSize(destPath+types.IncompleteSuffix, fileSize); err != nil {
 		t.Error(err)
-	}
-
-	// Verify .surge file was removed
-	surgeFile := destPath + types.IncompleteSuffix
-	if testutil.FileExists(surgeFile) {
-		t.Error(".surge file should be removed after successful download")
 	}
 
 	// Verify progress was tracked
@@ -393,6 +408,11 @@ func TestSingleDownloader_Download_Cancellation(t *testing.T) {
 
 	done := make(chan error)
 	go func() {
+		// Pre-create incomplete file (simulating processing layer)
+		if f, err := os.Create(destPath + ".surge"); err == nil {
+			_ = f.Close()
+		}
+
 		done <- downloader.Download(ctx, server.URL(), destPath, fileSize, "cancel.bin")
 	}()
 
@@ -432,6 +452,11 @@ func TestSingleDownloader_Download_ProgressTracking(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	// Pre-create incomplete file (simulating processing layer)
+	if f, err := os.Create(destPath + ".surge"); err == nil {
+		_ = f.Close()
+	}
+
 	err := downloader.Download(ctx, server.URL(), destPath, fileSize, "progress.bin")
 	if err != nil {
 		t.Fatalf("Download failed: %v", err)
@@ -467,6 +492,11 @@ func TestSingleDownloader_Download_ServerError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Pre-create incomplete file (simulating processing layer)
+	if f, err := os.Create(destPath + ".surge"); err == nil {
+		_ = f.Close()
+	}
+
 	err := downloader.Download(ctx, server.URL(), destPath, 1024, "error.bin")
 	if err == nil {
 		t.Error("Expected error from failed server")
@@ -495,6 +525,11 @@ func TestSingleDownloader_Download_WithLatency(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Pre-create incomplete file (simulating processing layer)
+	if f, err := os.Create(destPath + ".surge"); err == nil {
+		_ = f.Close()
+	}
+
 	err := downloader.Download(ctx, server.URL(), destPath, fileSize, "latency.bin")
 	elapsed := time.Since(start)
 
@@ -506,7 +541,7 @@ func TestSingleDownloader_Download_WithLatency(t *testing.T) {
 		t.Errorf("Download completed too fast (%v), latency not applied", elapsed)
 	}
 
-	if err := testutil.VerifyFileSize(destPath, fileSize); err != nil {
+	if err := testutil.VerifyFileSize(destPath+types.IncompleteSuffix, fileSize); err != nil {
 		t.Error(err)
 	}
 }
@@ -532,17 +567,22 @@ func TestSingleDownloader_Download_ContentIntegrity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Pre-create incomplete file (simulating processing layer)
+	if f, err := os.Create(destPath + ".surge"); err == nil {
+		_ = f.Close()
+	}
+
 	err := downloader.Download(ctx, server.URL(), destPath, fileSize, "content.bin")
 	if err != nil {
 		t.Fatalf("Download failed: %v", err)
 	}
 
-	if err := testutil.VerifyFileSize(destPath, fileSize); err != nil {
+	if err := testutil.VerifyFileSize(destPath+types.IncompleteSuffix, fileSize); err != nil {
 		t.Error(err)
 	}
 
 	// Verify content is not all zeros (random data was used)
-	chunk, err := testutil.ReadFileChunk(destPath, 0, 1024)
+	chunk, err := testutil.ReadFileChunk(destPath+types.IncompleteSuffix, 0, 1024)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,6 +625,11 @@ func BenchmarkSingleDownloader(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		// Pre-create incomplete file (simulating processing layer)
+		if f, err := os.Create(destPath + ".surge"); err == nil {
+			_ = f.Close()
+		}
+
 		err := downloader.Download(ctx, server.URL(), destPath, fileSize, "bench.bin")
 		if err != nil {
 			b.Fatalf("Download failed: %v", err)

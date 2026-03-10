@@ -2,6 +2,7 @@ package download
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -9,8 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/surge-downloader/surge/internal/engine"
+	"github.com/surge-downloader/surge/internal/engine/events"
 	"github.com/surge-downloader/surge/internal/engine/types"
+	"github.com/surge-downloader/surge/internal/processing"
 	"github.com/surge-downloader/surge/internal/testutil"
 )
 
@@ -135,6 +137,67 @@ func TestUniqueFilePath_MultipleExtensions(t *testing.T) {
 
 	if result != expected {
 		t.Errorf("uniqueFilePath() = %v, want %v", result, expected)
+	}
+}
+
+func TestTUIDownload_StartedEventUsesFullDestPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	fileSize := int64(2 * 1024 * 1024)
+	server := testutil.NewStreamingMockServerT(t,
+		fileSize,
+		testutil.WithRangeSupport(false),
+		testutil.WithByteLatency(50*time.Microsecond),
+	)
+	defer server.Close()
+
+	finalPath := filepath.Join(tmpDir, "file.bin")
+	surgePath := finalPath + types.IncompleteSuffix
+	f, err := os.Create(surgePath)
+	if err != nil {
+		t.Fatalf("failed to pre-create incomplete file: %v", err)
+	}
+	_ = f.Close()
+
+	progressCh := make(chan any, 16)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := types.DownloadConfig{
+		URL:           server.URL(),
+		OutputPath:    tmpDir,
+		Filename:      "file.bin",
+		ID:            "started-event-test",
+		ProgressCh:    progressCh,
+		State:         types.NewProgressState("started-event-test", fileSize),
+		Runtime:       &types.RuntimeConfig{},
+		TotalSize:     fileSize,
+		SupportsRange: false,
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- TUIDownload(ctx, &cfg)
+	}()
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case msg := <-progressCh:
+			started, ok := msg.(events.DownloadStartedMsg)
+			if !ok {
+				continue
+			}
+			if started.DestPath != finalPath {
+				t.Fatalf("started dest path = %q, want %q", started.DestPath, finalPath)
+			}
+			cancel()
+			if err := <-errCh; err != nil && !errors.Is(err, context.Canceled) {
+				t.Fatalf("download returned unexpected error after cancel: %v", err)
+			}
+			return
+		case <-deadline:
+			t.Fatal("timed out waiting for started event")
+		}
 	}
 }
 
@@ -271,7 +334,7 @@ func TestProbeServer_RangeSupported(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	result, err := engine.ProbeServer(ctx, server.URL(), "", nil)
+	result, err := processing.ProbeServer(ctx, server.URL(), "", nil)
 	if err != nil {
 		t.Fatalf("probeServer failed: %v", err)
 	}
@@ -294,7 +357,7 @@ func TestProbeServer_RangeNotSupported(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	result, err := engine.ProbeServer(ctx, server.URL(), "", nil)
+	result, err := processing.ProbeServer(ctx, server.URL(), "", nil)
 	if err != nil {
 		t.Fatalf("probeServer failed: %v", err)
 	}
@@ -318,7 +381,7 @@ func TestProbeServer_CustomFilenameHint(t *testing.T) {
 	defer cancel()
 
 	// Provide a custom filename hint
-	result, err := engine.ProbeServer(ctx, server.URL(), "my-custom-file.zip", nil)
+	result, err := processing.ProbeServer(ctx, server.URL(), "my-custom-file.zip", nil)
 	if err != nil {
 		t.Fatalf("probeServer failed: %v", err)
 	}
@@ -338,7 +401,7 @@ func TestProbeServer_ContentType(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	result, err := engine.ProbeServer(ctx, server.URL(), "", nil)
+	result, err := processing.ProbeServer(ctx, server.URL(), "", nil)
 	if err != nil {
 		t.Fatalf("probeServer failed: %v", err)
 	}
@@ -352,7 +415,7 @@ func TestProbeServer_InvalidURL(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := engine.ProbeServer(ctx, "http://invalid-host-that-does-not-exist.test:9999/file", "", nil)
+	_, err := processing.ProbeServer(ctx, "http://invalid-host-that-does-not-exist.test:9999/file", "", nil)
 	if err == nil {
 		t.Error("Expected error for invalid URL")
 	}
@@ -369,7 +432,7 @@ func TestProbeServer_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := engine.ProbeServer(ctx, server.URL(), "", nil)
+	_, err := processing.ProbeServer(ctx, server.URL(), "", nil)
 	if err == nil {
 		t.Error("Expected error when context is cancelled")
 	}
@@ -385,7 +448,7 @@ func TestProbeServer_UnexpectedStatusCode(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := engine.ProbeServer(ctx, server.URL, "", nil)
+	_, err := processing.ProbeServer(ctx, server.URL, "", nil)
 	if err == nil {
 		t.Error("Expected error for 404 status")
 	}
@@ -401,7 +464,7 @@ func TestProbeServer_ServerError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	_, err := engine.ProbeServer(ctx, server.URL, "", nil)
+	_, err := processing.ProbeServer(ctx, server.URL, "", nil)
 	if err == nil {
 		t.Error("Expected error for 500 status")
 	}
@@ -417,7 +480,7 @@ func TestProbeServer_ZeroFileSize(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	result, err := engine.ProbeServer(ctx, server.URL, "", nil)
+	result, err := processing.ProbeServer(ctx, server.URL, "", nil)
 	if err != nil {
 		t.Fatalf("probeServer failed: %v", err)
 	}
@@ -462,7 +525,7 @@ func TestProbeServer_ContentRangeFormats(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 
-			result, err := engine.ProbeServer(ctx, server.URL, "", nil)
+			result, err := processing.ProbeServer(ctx, server.URL, "", nil)
 			if err != nil {
 				t.Fatalf("probeServer failed: %v", err)
 			}
@@ -492,7 +555,7 @@ func TestProbeServer_LargeFile(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	result, err := engine.ProbeServer(ctx, server.URL, "", nil)
+	result, err := processing.ProbeServer(ctx, server.URL, "", nil)
 	if err != nil {
 		t.Fatalf("probeServer failed: %v", err)
 	}

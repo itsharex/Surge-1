@@ -14,7 +14,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/surge-downloader/surge/internal/config"
-	"github.com/surge-downloader/surge/internal/core"
 	"github.com/surge-downloader/surge/internal/utils"
 )
 
@@ -172,9 +171,12 @@ func startServerLogic(cmd *cobra.Command, args []string, portFlag int, batchFile
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+	resetGlobalEnqueueContext()
 
-	// Initialize Service
-	GlobalService = core.NewLocalDownloadServiceWithInput(GlobalPool, GlobalProgressCh)
+	if err := ensureGlobalLocalServiceAndLifecycle(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating lifecycle event stream: %v\n", err)
+		os.Exit(1)
+	}
 
 	saveActivePort(port)
 	defer removeActivePort()
