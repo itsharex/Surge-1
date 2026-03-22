@@ -212,6 +212,11 @@ func applyListTheme(l *list.Model) {
 
 // UpdateListItems updates the list with filtered downloads based on active tab
 func (m *RootModel) UpdateListItems() {
+
+	if m.list.Width() == 0 {
+		return
+	}
+
 	// If the user manually switched tabs, don't try to preserve/follow selection
 	if m.ManualTabSwitch {
 		m.ManualTabSwitch = false
@@ -273,7 +278,6 @@ func (m *RootModel) UpdateListItems() {
 					// If it belongs to a different tab, switch to it
 					if newTab != -1 && newTab != m.activeTab {
 						m.activeTab = newTab
-						m.updateListTitle()
 
 						// Force selection for the recursive call
 						m.SelectedDownloadID = targetID
