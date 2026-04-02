@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/surge-downloader/surge/internal/tui/colors"
+	"github.com/SurgeDM/Surge/internal/tui/colors"
 )
 
 func TestStatusRender_ReflectsThemeChanges(t *testing.T) {

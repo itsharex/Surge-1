@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/SurgeDM/Surge/internal/utils"
 	"github.com/spf13/cobra"
-	"github.com/surge-downloader/surge/internal/utils"
 )
 
 var refreshCmd = &cobra.Command{

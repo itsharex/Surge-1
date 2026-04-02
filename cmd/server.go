@@ -12,9 +12,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/SurgeDM/Surge/internal/utils"
 	"github.com/spf13/cobra"
-	"github.com/surge-downloader/surge/internal/config"
-	"github.com/surge-downloader/surge/internal/utils"
 )
 
 var serverCmd = &cobra.Command{

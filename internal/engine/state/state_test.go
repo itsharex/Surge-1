@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/SurgeDM/Surge/internal/engine/types"
 	"github.com/google/uuid"
-	"github.com/surge-downloader/surge/internal/engine/types"
 )
 
 func setupTestDB(t *testing.T) string {

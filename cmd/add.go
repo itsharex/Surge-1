@@ -3,8 +3,8 @@ package cmd
 import (
 	"fmt"
 
+	"github.com/SurgeDM/Surge/internal/utils"
 	"github.com/spf13/cobra"
-	"github.com/surge-downloader/surge/internal/utils"
 )
 
 var addCmd = &cobra.Command{

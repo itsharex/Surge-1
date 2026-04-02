@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/surge-downloader/surge/internal/config"
-	"github.com/surge-downloader/surge/internal/tui/colors"
-	"github.com/surge-downloader/surge/internal/tui/components"
+	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/SurgeDM/Surge/internal/tui/colors"
+	"github.com/SurgeDM/Surge/internal/tui/components"
 
 	"charm.land/lipgloss/v2"
 )
